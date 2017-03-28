@@ -18,30 +18,30 @@
 
 package com.cloudera.livy.test
 
-import java.io.{File, FileOutputStream}
+import java.io.{File, InputStream}
 import java.net.URI
 import java.nio.charset.StandardCharsets.UTF_8
-import java.nio.file.Files
-import java.util.UUID
+import java.nio.file.{Files, StandardCopyOption}
 import java.util.concurrent.{Future => JFuture, TimeUnit}
-import java.util.jar.JarOutputStream
-import java.util.zip.ZipEntry
 import javax.servlet.http.HttpServletResponse
 
-import scala.util.Try
+import scala.collection.JavaConverters._
+import scala.util.{Properties, Try}
 
-import org.apache.hadoop.fs.Path
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
 import org.scalatest.BeforeAndAfterAll
 
-import com.cloudera.livy.{LivyClient, LivyClientBuilder, Logging}
+import com.cloudera.livy._
 import com.cloudera.livy.client.common.HttpMessages._
-import com.cloudera.livy.sessions.SessionState
+import com.cloudera.livy.sessions.SessionKindModule
 import com.cloudera.livy.test.framework.BaseIntegrationTestSuite
 import com.cloudera.livy.test.jobs._
+import com.cloudera.livy.utils.LivySparkUtils
 
 // Proper type representing the return value of "GET /sessions". At some point we should make
 // SessionServlet use something like this.
-private class SessionList {
+class SessionList {
   val from: Int = -1
   val total: Int = -1
   val sessions: List[SessionInfo] = Nil
@@ -52,6 +52,9 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
   private var client: LivyClient = _
   private var sessionId: Int = _
   private var client2: LivyClient = _
+  private val mapper = new ObjectMapper()
+    .registerModule(DefaultScalaModule)
+    .registerModule(new SessionKindModule())
 
   override def afterAll(): Unit = {
     super.afterAll()
@@ -61,7 +64,7 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
       }
     }
 
-    livyClient.stopSession(sessionId)
+    livyClient.connectSession(sessionId).stop()
   }
 
   test("create a new session and upload test jar") {
@@ -74,7 +77,7 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
       assert(list.total === 1)
       val tempSessionId = list.sessions(0).id
 
-      waitTillSessionIdle(tempSessionId)
+      livyClient.connectSession(tempSessionId).verifySessionIdle()
       waitFor(tempClient.uploadJar(new File(testLib)))
 
       client = tempClient
@@ -127,13 +130,13 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
 
   test("run spark job") {
     assume(client != null, "Client not active.")
-    val result = waitFor(client.submit(new SmallCount(100)));
+    val result = waitFor(client.submit(new SmallCount(100)))
     assert(result === 100)
   }
 
   test("run spark sql job") {
     assume(client != null, "Client not active.")
-    val result = waitFor(client.submit(new SQLGetTweets(false)));
+    val result = waitFor(client.submit(new SQLGetTweets(false)))
     assert(result.size() > 0)
   }
 
@@ -144,7 +147,7 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
   }
 
   test("connect to an existing session") {
-    assert(livyClient.getSessionStatus(sessionId) === SessionState.Idle().toString)
+    livyClient.connectSession(sessionId).verifySessionIdle()
     val sessionUri = s"$livyEndpoint/sessions/$sessionId"
     client2 = createClient(sessionUri)
   }
@@ -155,7 +158,7 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
     assert(result === "hello")
   }
 
-  test("run scala jobs") {
+  scalaTest("run scala jobs") {
     assume(client2 != null, "Client not active.")
 
     val jobs = Seq(
@@ -170,6 +173,15 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
     jobs.foreach { job =>
       val result = waitFor(client2.submit(job))
       assert(result === job.value)
+    }
+  }
+
+  protected def scalaTest(desc: String)(testFn: => Unit): Unit = {
+    test(desc) {
+      assume(sys.env("LIVY_SPARK_SCALA_VERSION") ==
+        LivySparkUtils.formatScalaVersion(Properties.versionNumberString),
+        s"Scala test can only be run with ${Properties.versionString}")
+      testFn
     }
   }
 
@@ -188,6 +200,13 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
     assert(result === "foo")
   }
 
+  test("return null should not throw NPE") {
+    assume(client2 != null, "Client not active")
+
+    val result = waitFor(client2.submit(new VoidJob()))
+    assert(result === null)
+  }
+
   test("destroy the session") {
     assume(client2 != null, "Client not active.")
     client2.stop(true)
@@ -204,6 +223,62 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
     sessionId = -1
   }
 
+  pytest("validate Python-API requests") {
+    val addFileContent = "hello from addfile"
+    val addFilePath = createTempFilesForTest("add_file", ".txt", addFileContent, true)
+    val addPyFileContent = "def test_add_pyfile(): return \"hello from addpyfile\""
+    val addPyFilePath = createTempFilesForTest("add_pyfile", ".py", addPyFileContent, true)
+    val uploadFileContent = "hello from uploadfile"
+    val uploadFilePath = createTempFilesForTest("upload_pyfile", ".py", uploadFileContent, false)
+    val uploadPyFileContent = "def test_upload_pyfile(): return \"hello from uploadpyfile\""
+    val uploadPyFilePath = createTempFilesForTest("upload_pyfile", ".py",
+      uploadPyFileContent, false)
+
+    val builder = new ProcessBuilder(Seq("python", createPyTestsForPythonAPI().toString).asJava)
+
+    val env = builder.environment()
+    env.put("LIVY_END_POINT", livyEndpoint)
+    env.put("ADD_FILE_URL", addFilePath)
+    env.put("ADD_PYFILE_URL", addPyFilePath)
+    env.put("UPLOAD_FILE_URL", uploadFilePath)
+    env.put("UPLOAD_PYFILE_URL", uploadPyFilePath)
+
+    builder.redirectOutput(new File(sys.props("java.io.tmpdir") + "/pytest_results.txt"))
+    builder.redirectErrorStream(true)
+
+    val process = builder.start()
+
+    process.waitFor()
+
+    assert(process.exitValue() === 0)
+  }
+
+  private def createPyTestsForPythonAPI(): File = {
+    var source: InputStream = null
+    try {
+      source = getClass.getClassLoader.getResourceAsStream("test_python_api.py")
+      val file = Files.createTempFile("", "").toFile
+      Files.copy(source, file.toPath, StandardCopyOption.REPLACE_EXISTING)
+      file
+    } finally {
+      source.close()
+    }
+  }
+
+  private def createTempFilesForTest(
+      fileName: String,
+      fileExtension: String,
+      fileContent: String,
+      uploadFileToHdfs: Boolean): String = {
+    val path = Files.createTempFile(fileName, fileExtension)
+    Files.write(path, fileContent.getBytes(UTF_8))
+    if (uploadFileToHdfs) {
+      uploadToHdfs(path.toFile())
+    } else {
+      path.toString
+    }
+  }
+
   private def waitFor[T](future: JFuture[T]): T = {
     future.get(30, TimeUnit.SECONDS)
   }
@@ -217,5 +292,4 @@ class JobApiIT extends BaseIntegrationTestSuite with BeforeAndAfterAll with Logg
   private def createClient(uri: String): LivyClient = {
     new LivyClientBuilder().setURI(new URI(uri)).build()
   }
-
 }

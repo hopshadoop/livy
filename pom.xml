@@ -23,7 +23,7 @@
 
   <groupId>com.cloudera.livy</groupId>
   <artifactId>livy-main</artifactId>
-  <version>0.3.0-SNAPSHOT</version>
+  <version>0.4.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
   <name>livy-main</name>
@@ -42,8 +42,9 @@
   </organization>
 
   <properties>
-    <hadoop.version>2.6.0-cdh5.5.0</hadoop.version>
-    <spark.version>1.5.0-cdh5.5.0</spark.version>
+    <hadoop.version>2.7.3</hadoop.version>
+    <hadoop.scope>compile</hadoop.scope>
+    <spark.version>1.6.2</spark.version>
     <commons-codec.version>1.9</commons-codec.version>
     <httpclient.version>4.5.2</httpclient.version>
     <httpcore.version>4.4.4</httpcore.version>
@@ -55,11 +56,13 @@
     <kryo.version>2.22</kryo.version>
     <metrics.version>3.1.0</metrics.version>
     <mockito.version>1.9.5</mockito.version>
-    <netty.version>4.0.23.Final</netty.version>
+    <netty.version>4.0.29.Final</netty.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <py4j.version>0.8.2.1</py4j.version>
+    <py4j.version>0.9</py4j.version>
+    <scala-2.10.version>2.10.4</scala-2.10.version>
+    <scala-2.11.version>2.11.8</scala-2.11.version>
     <scala.binary.version>2.10</scala.binary.version>
-    <scala.version>2.10.4</scala.version>
+    <scala.version>${scala-2.10.version}</scala.version>
     <scalatest.version>2.2.4</scalatest.version>
     <scalatra.version>2.3.0</scalatra.version>
     <java.version>1.7</java.version>
@@ -68,9 +71,14 @@
     <test.redirectToFile>true</test.redirectToFile>
     <execution.root>${user.dir}</execution.root>
     <spark.home>${execution.root}/dev/spark</spark.home>
+    <!--  used for testing, NCSARequestLog use it for access log  -->
+    <livy.log.dir>${basedir}/target</livy.log.dir>
 
     <!-- Set this to "true" to skip R tests. -->
     <skipRTests>false</skipRTests>
+
+    <!-- Set this to "true" to skip PySpark3 tests. -->
+    <skipPySpark3Tests>false</skipPySpark3Tests>
 
     <!--
       Properties for the copyright header style checks. Modules that use the ASF header
@@ -78,10 +86,10 @@
     -->
 
     <!--
-      By default artifacts are not deployed. Artifacts that should be deployed to a maven
-      repo should override the "skipDeploy" property in their pom.
+      Artifacts that should not be deployed to a maven repo should override the "skipDeploy"
+      property in their pom.
     -->
-    <skipDeploy>true</skipDeploy>
+    <skipDeploy>false</skipDeploy>
 
     <asf.copyright.header><![CDATA[/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
@@ -122,7 +130,11 @@
 
     <MaxPermGen>512m</MaxPermGen>
     <CodeCacheSize>512m</CodeCacheSize>
+
+    <!-- Where to deploy artifacts. -->
+    <repository.root>http://maven.jenkins.cloudera.com:8081/artifactory</repository.root>
   </properties>
+
   <repositories>
     <repository>
       <id>cdh.repo</id>
@@ -161,7 +173,6 @@
         <enabled>false</enabled>
       </snapshots>
     </repository>
-
   </repositories>
 
   <modules>
@@ -170,10 +181,24 @@
     <module>client-common</module>
     <module>client-http</module>
     <module>core</module>
+    <module>core/scala-2.10</module>
+    <module>core/scala-2.11</module>
+    <module>coverage</module>
+    <module>examples</module>
+    <module>python-api</module>
     <module>repl</module>
+    <module>repl/scala-2.10</module>
+    <module>repl/scala-2.11</module>
     <module>rsc</module>
+    <module>scala</module>
+    <module>scala-api</module>
+    <module>scala-api/scala-2.10</module>
+    <module>scala-api/scala-2.11</module>
     <module>server</module>
     <module>test-lib</module>
+    <module>integration-test/minicluster-dependencies</module>
+    <module>integration-test/minicluster-dependencies/scala-2.10</module>
+    <module>integration-test/minicluster-dependencies/scala-2.11</module>
     <module>integration-test</module>
   </modules>
 
@@ -566,14 +591,13 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-antrun-plugin</artifactId>
-          <version>1.6</version>
+          <version>1.8</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
           <version>2.3.2</version>
         </plugin>
-
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-deploy-plugin</artifactId>
@@ -587,6 +611,12 @@
         </plugin>
 
         <plugin>
+          <groupId>org.codehaus.mojo</groupId>
+          <artifactId>build-helper-maven-plugin</artifactId>
+          <version>1.10</version>
+        </plugin>
+
+        <plugin>
           <groupId>net.alchim31.maven</groupId>
           <artifactId>scala-maven-plugin</artifactId>
           <version>3.2.2</version>
@@ -595,6 +625,13 @@
               <goals>
                 <goal>compile</goal>
                 <goal>testCompile</goal>
+              </goals>
+            </execution>
+            <execution>
+              <id>scala-compile-first</id>
+              <phase>process-resources</phase>
+              <goals>
+                <goal>compile</goal>
               </goals>
             </execution>
           </executions>
@@ -653,10 +690,11 @@
               <spark.ui.enabled>false</spark.ui.enabled>
               <project.version>${project.version}</project.version>
               <skipRTests>${skipRTests}</skipRTests>
+              <skipPySpark3Tests>${skipPySpark3Tests}</skipPySpark3Tests>
             </systemProperties>
             <redirectTestOutputToFile>${test.redirectToFile}</redirectTestOutputToFile>
             <useFile>${test.redirectToFile}</useFile>
-            <argLine>${argLine} -Xmx1g -XX:MaxPermSize=256m</argLine>
+            <argLine>${argLine} -Xmx2g -XX:MaxPermSize=512m</argLine>
             <failIfNoTests>false</failIfNoTests>
           </configuration>
         </plugin>
@@ -669,6 +707,7 @@
             <environmentVariables>
               <LIVY_TEST>true</LIVY_TEST>
               <SPARK_HOME>${spark.home}</SPARK_HOME>
+              <LIVY_LOG_DIR>${livy.log.dir}</LIVY_LOG_DIR>
             </environmentVariables>
             <systemProperties>
               <java.awt.headless>true</java.awt.headless>
@@ -678,12 +717,13 @@
               <spark.ui.enabled>false</spark.ui.enabled>
               <project.version>${project.version}</project.version>
               <skipRTests>${skipRTests}</skipRTests>
+              <skipPySpark3Tests>${skipPySpark3Tests}</skipPySpark3Tests>
             </systemProperties>
             <stdout>D</stdout>
             <reportsDirectory>${project.build.directory}/surefire-reports</reportsDirectory>
             <junitxml>.</junitxml>
             <filereports>WDF TestSuite.txt</filereports>
-            <argLine>${argLine} -Xmx1g -XX:MaxPermSize=256m</argLine>
+            <argLine>${argLine} -Xmx2g -XX:MaxPermSize=512m</argLine>
           </configuration>
           <executions>
             <execution>
@@ -761,14 +801,8 @@
       </plugin>
 
       <plugin>
-        <groupId>net.alchim31.maven</groupId>
-        <artifactId>scala-maven-plugin</artifactId>
-      </plugin>
-
-      <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-antrun-plugin</artifactId>
-        <version>1.8</version>
         <executions>
           <!-- Cleans up files that tests append to (because we have two test plugins). -->
           <execution>
@@ -780,7 +814,7 @@
             <configuration>
               <target>
                 <delete file="${project.build.directory}/unit-tests.log" quiet="true" />
-                <delete file="${project.build.directory}/jacoco.exec" quiet="true" />
+                <delete dir="${project.build.directory}/jacoco" quiet="true" />
                 <delete dir="${project.build.directory}/tmp" quiet="true" />
               </target>
             </configuration>
@@ -906,14 +940,9 @@
       </plugin>
 
       <plugin>
-        <groupId>org.scalatest</groupId>
-        <artifactId>scalatest-maven-plugin</artifactId>
-      </plugin>
-
-      <plugin>
         <groupId>org.jacoco</groupId>
         <artifactId>jacoco-maven-plugin</artifactId>
-        <version>0.7.5.201505241946</version>
+        <version>0.7.7.201606060606</version>
         <executions>
           <execution>
             <goals>
@@ -923,30 +952,6 @@
               <append>true</append>
               <destFile>${project.build.directory}/jacoco/main.exec</destFile>
             </configuration>
-          </execution>
-          <execution>
-            <id>merge-reports</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>merge</goal>
-            </goals>
-            <configuration>
-              <fileSets>
-                <fileSet>
-                  <directory>${project.build.directory}/jacoco</directory>
-                  <includes>
-                    <include>*.exec</include>
-                  </includes>
-                </fileSet>
-              </fileSets>
-            </configuration>
-          </execution>
-          <execution>
-            <id>report</id>
-            <phase>verify</phase>
-            <goals>
-              <goal>report</goal>
-            </goals>
           </execution>
         </executions>
       </plugin>
@@ -963,5 +968,79 @@
       </plugin>
     </plugins>
   </reporting>
+
+  <distributionManagement>
+    <repository>
+      <id>cdh.releases.repo</id>
+      <url>${repository.root}/cdh-staging-local</url>
+      <name>CDH Releases Repository</name>
+    </repository>
+    <snapshotRepository>
+      <id>cdh.snapshots.repo</id>
+      <url>${repository.root}/cdh-snapshot-local</url>
+      <name>CDH Snapshots Repository</name>
+    </snapshotRepository>
+  </distributionManagement>
+
+  <profiles>
+    <!-- Spark version profile -->
+    <profile>
+      <id>spark-1.6</id>
+      <activation>
+        <property>
+          <name>!spark-2.0</name>
+        </property>
+      </activation>
+      <properties>
+        <spark.version>1.6.2</spark.version>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>spark-2.0</id>
+      <activation>
+        <property>
+          <name>spark-2.0</name>
+        </property>
+      </activation>
+      <properties>
+        <spark.version>2.0.1</spark.version>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>spark-2.1</id>
+      <activation>
+        <property>
+          <name>spark-2.1</name>
+        </property>
+      </activation>
+      <properties>
+        <spark.version>2.1.0</spark.version>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>skip-parent-modules</id>
+      <activation>
+        <file>
+          <missing>src/main/resources/build.marker</missing>
+        </file>
+      </activation>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.scalatest</groupId>
+            <artifactId>scalatest-maven-plugin</artifactId>
+          </plugin>
+          <plugin>
+            <groupId>net.alchim31.maven</groupId>
+            <artifactId>scala-maven-plugin</artifactId>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+
+  </profiles>
 
 </project>

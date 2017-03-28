@@ -19,7 +19,6 @@
 package com.cloudera.livy.server.interactive
 
 import java.net.URI
-import java.util.concurrent.TimeUnit
 import javax.servlet.http.HttpServletRequest
 
 import scala.collection.JavaConverters._
@@ -31,14 +30,21 @@ import org.scalatra._
 import org.scalatra.servlet.FileUploadSupport
 
 import com.cloudera.livy.{ExecuteRequest, JobHandle, LivyConf, Logging}
+import com.cloudera.livy.client.common.HttpMessages
 import com.cloudera.livy.client.common.HttpMessages._
+import com.cloudera.livy.rsc.driver.Statement
 import com.cloudera.livy.server.SessionServlet
+import com.cloudera.livy.server.recovery.SessionStore
 import com.cloudera.livy.sessions._
 
 object InteractiveSessionServlet extends Logging
 
-class InteractiveSessionServlet(livyConf: LivyConf)
-  extends SessionServlet[InteractiveSession](livyConf)
+class InteractiveSessionServlet(
+    sessionManager: InteractiveSessionManager,
+    sessionStore: SessionStore,
+    livyConf: LivyConf)
+  extends SessionServlet(sessionManager, livyConf)
+  with SessionHeartbeatNotifier[InteractiveSession, InteractiveRecoveryMetadata]
   with FileUploadSupport
 {
 
@@ -48,11 +54,16 @@ class InteractiveSessionServlet(livyConf: LivyConf)
   override protected def createSession(req: HttpServletRequest): InteractiveSession = {
     val createRequest = bodyAs[CreateInteractiveRequest](req)
     val proxyUser = checkImpersonation(createRequest.proxyUser, req)
-    new InteractiveSession(sessionManager.nextId(), remoteUser(req), proxyUser, livyConf,
-      createRequest)
+    InteractiveSession.create(
+      sessionManager.nextId(),
+      remoteUser(req),
+      proxyUser,
+      livyConf,
+      createRequest,
+      sessionStore)
   }
 
-  override protected def clientSessionView(
+  override protected[interactive] def clientSessionView(
       session: InteractiveSession,
       req: HttpServletRequest): Any = {
     val logs =
@@ -70,48 +81,33 @@ class InteractiveSessionServlet(livyConf: LivyConf)
         Nil
       }
 
-    new SessionInfo(session.id, session.owner, session.proxyUser.orNull, session.state.toString,
-      session.kind.toString, logs.asJava)
-  }
-
-  private def statementView(statement: Statement): Any = {
-    val output = try {
-      Await.result(statement.output(), Duration(100, TimeUnit.MILLISECONDS))
-    } catch {
-      case _: TimeoutException => null
-    }
-    Map(
-      "id" -> statement.id,
-      "state" -> statement.state.toString,
-      "output" -> output)
+    new SessionInfo(session.id, session.appId.orNull, session.owner, session.proxyUser.orNull,
+      session.state.toString, session.kind.toString, session.appInfo.asJavaMap, logs.asJava)
   }
 
   post("/:id/stop") {
     withSession { session =>
-      val future = session.stop()
-      new AsyncResult() { val is = for { _ <- future } yield NoContent() }
+      Await.ready(session.stop(), Duration.Inf)
+      NoContent()
     }
   }
 
   post("/:id/interrupt") {
     withSession { session =>
-      val future = for {
-        _ <- session.interrupt()
-      } yield Ok(Map("msg" -> "interrupted"))
-
-      // FIXME: this is silently eating exceptions.
-      new AsyncResult() { val is = future }
+      Await.ready(session.interrupt(), Duration.Inf)
+      Ok(Map("msg" -> "interrupted"))
     }
   }
 
   get("/:id/statements") {
     withSession { session =>
+      val statements = session.statements
       val from = params.get("from").map(_.toInt).getOrElse(0)
-      val size = params.get("size").map(_.toInt).getOrElse(session.statements.length)
+      val size = params.get("size").map(_.toInt).getOrElse(statements.length)
 
       Map(
-        "total_statements" -> session.statements.length,
-        "statements" -> session.statements.view(from, from + size).map(statementView)
+        "total_statements" -> statements.length,
+        "statements" -> statements.view(from, from + size)
       )
     }
   }
@@ -119,14 +115,8 @@ class InteractiveSessionServlet(livyConf: LivyConf)
   val getStatement = get("/:id/statements/:statementId") {
     withSession { session =>
       val statementId = params("statementId").toInt
-      val from = params.get("from").map(_.toInt)
-      val size = params.get("size").map(_.toInt)
 
-      session.statements.lift(statementId) match {
-        case None => NotFound("Statement not found")
-        case Some(statement) =>
-          statementView(statement)
-      }
+      session.getStatement(statementId).getOrElse(NotFound("Statement not found"))
     }
   }
 
@@ -134,7 +124,7 @@ class InteractiveSessionServlet(livyConf: LivyConf)
     withSession { session =>
       val statement = session.executeStatement(req)
 
-      Created(statementView(statement),
+      Created(statement,
         headers = Map(
           "Location" -> url(getStatement,
             "id" -> session.id.toString,
@@ -142,6 +132,13 @@ class InteractiveSessionServlet(livyConf: LivyConf)
     }
   }
 
+  post("/:id/statements/:statementId/cancel") {
+    withSession { session =>
+      val statementId = params("statementId")
+      session.cancelStatement(statementId.toInt)
+      Ok(Map("msg" -> "canceled"))
+    }
+  }
   // This endpoint is used by the client-http module to "connect" to an existing session and
   // update its last activity time. It performs authorization checks to make sure the caller
   // has access to the session, so even though it returns the same data, it behaves differently
@@ -179,11 +176,20 @@ class InteractiveSessionServlet(livyConf: LivyConf)
     withSession { lsession =>
       fileParams.get("jar") match {
         case Some(file) =>
-          doAsync {
-            lsession.addJar(file.getInputStream, file.name)
-          }
+          lsession.addJar(file.getInputStream, file.name)
         case None =>
-          BadRequest("No jar uploaded!")
+          BadRequest("No jar sent!")
+      }
+    }
+  }
+
+  post("/:id/upload-pyfile") {
+    withSession { lsession =>
+      fileParams.get("file") match {
+        case Some(file) =>
+          lsession.addJar(file.getInputStream, file.name)
+        case None =>
+          BadRequest("No file sent!")
       }
     }
   }
@@ -192,9 +198,7 @@ class InteractiveSessionServlet(livyConf: LivyConf)
     withSession { lsession =>
       fileParams.get("file") match {
         case Some(file) =>
-          doAsync {
-            lsession.addFile(file.getInputStream, file.name)
-          }
+          lsession.addFile(file.getInputStream, file.name)
         case None =>
           BadRequest("No file sent!")
       }
@@ -203,9 +207,15 @@ class InteractiveSessionServlet(livyConf: LivyConf)
 
   jpost[AddResource]("/:id/add-jar") { req =>
     withSession { lsession =>
-      val uri = new URI(req.uri)
-      doAsync {
-        lsession.addJar(uri)
+      addJarOrPyFile(req, lsession)
+    }
+  }
+
+  jpost[AddResource]("/:id/add-pyfile") { req =>
+    withSession { lsession =>
+      lsession.kind match {
+        case PySpark() | PySpark3() => addJarOrPyFile(req, lsession)
+        case _ => BadRequest("Only supported for pyspark sessions.")
       }
     }
   }
@@ -213,24 +223,26 @@ class InteractiveSessionServlet(livyConf: LivyConf)
   jpost[AddResource]("/:id/add-file") { req =>
     withSession { lsession =>
       val uri = new URI(req.uri)
-      doAsync {
-        lsession.addFile(uri)
-      }
+      lsession.addFile(uri)
     }
   }
 
   get("/:id/jobs/:jobid") {
     withSession { lsession =>
       val jobId = params("jobid").toLong
-      doAsync { Ok(lsession.jobStatus(jobId)) }
+      Ok(lsession.jobStatus(jobId))
     }
   }
 
   post("/:id/jobs/:jobid/cancel") {
     withSession { lsession =>
       val jobId = params("jobid").toLong
-      doAsync { lsession.cancelJob(jobId) }
+      lsession.cancelJob(jobId)
     }
   }
 
+  private def addJarOrPyFile(req: HttpMessages.AddResource, session: InteractiveSession): Unit = {
+    val uri = new URI(req.uri)
+    session.addJar(uri)
+  }
 }

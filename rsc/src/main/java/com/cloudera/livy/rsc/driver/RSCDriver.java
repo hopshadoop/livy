@@ -19,6 +19,8 @@ package com.cloudera.livy.rsc.driver;
 
 import java.io.File;
 import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
@@ -41,8 +43,11 @@ import io.netty.channel.ChannelHandler.Sharable;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.util.concurrent.ScheduledFuture;
 import org.apache.commons.io.FileUtils;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.Path;
 import org.apache.spark.SparkConf;
-import org.apache.spark.api.java.JavaFutureAction;
+import org.apache.spark.SparkContext;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +61,7 @@ import com.cloudera.livy.rsc.Utils;
 import com.cloudera.livy.rsc.rpc.Rpc;
 import com.cloudera.livy.rsc.rpc.RpcDispatcher;
 import com.cloudera.livy.rsc.rpc.RpcServer;
+
 import static com.cloudera.livy.rsc.RSCConf.Entry.*;
 
 /**
@@ -74,7 +80,7 @@ public class RSCDriver extends BaseProtocol {
   // Used to queue up requests while the SparkContext is being created.
   private final List<JobWrapper<?>> jobQueue;
   // Keeps track of connected clients.
-  private final Collection<Rpc> clients;
+  protected final Collection<Rpc> clients;
 
   final Map<String, JobWrapper<?>> activeJobs;
   private final Collection<BypassJobWrapper> bypassJobs;
@@ -157,6 +163,19 @@ public class RSCDriver extends BaseProtocol {
     // on the cluster, it would be tricky to solve that problem in a generic way.
     livyConf.set(RPC_SERVER_ADDRESS, null);
 
+    if (livyConf.getBoolean(TEST_STUCK_START_DRIVER)) {
+      // Test flag is turned on so we will just infinite loop here. It should cause
+      // timeout and we should still see yarn application being cleaned up.
+      LOG.info("Infinite looping as test flag TEST_STUCK_START_SESSION is turned on.");
+      while(true) {
+        try {
+          TimeUnit.MINUTES.sleep(10);
+        } catch (InterruptedException e) {
+          LOG.warn("Interrupted during test sleep.", e);
+        }
+      }
+    }
+
     // Bring up the RpcServer an register the secret provided by the Livy server as a client.
     LOG.info("Starting RPC server...");
     this.server = new RpcServer(livyConf);
@@ -165,6 +184,11 @@ public class RSCDriver extends BaseProtocol {
       public RpcDispatcher onNewClient(Rpc client) {
         registerClient(client);
         return RSCDriver.this;
+      }
+
+      @Override
+      public void onSaslComplete(Rpc client) {
+        onClientAuthenticated(client);
       }
     });
 
@@ -235,6 +259,16 @@ public class RSCDriver extends BaseProtocol {
     }
   }
 
+  protected void broadcast(Object msg) {
+    for (Rpc client : clients) {
+      try {
+        client.call(msg);
+      } catch (Exception e) {
+        LOG.warn("Failed to send message to client " + client, e);
+      }
+    }
+  }
+
   /**
    * Initializes the SparkContext used by this driver. This implementation creates a
    * context with the provided configuration. Subclasses can override this behavior,
@@ -248,6 +282,10 @@ public class RSCDriver extends BaseProtocol {
     LOG.info("Spark context finished initialization in {}ms",
       TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1));
     return sc;
+  }
+
+  protected void onClientAuthenticated(final Rpc client) {
+
   }
 
   /**
@@ -275,16 +313,6 @@ public class RSCDriver extends BaseProtocol {
     }
   }
 
-  private void broadcast(Object msg) {
-    for (Rpc client : clients) {
-      try {
-        client.call(msg);
-      } catch (Exception e) {
-        LOG.warn("Failed to send message to client " + client, e);
-      }
-    }
-  }
-
   void run() throws Exception {
     this.running = true;
 
@@ -299,7 +327,7 @@ public class RSCDriver extends BaseProtocol {
 
       JavaSparkContext sc = initializeContext();
       synchronized (jcLock) {
-        jc = new JobContextImpl(sc, localTmpDir);
+        jc = new JobContextImpl(sc, localTmpDir, this);
         jcLock.notifyAll();
       }
 
@@ -364,8 +392,12 @@ public class RSCDriver extends BaseProtocol {
   }
 
   public void handle(ChannelHandlerContext ctx, EndSession msg) {
-    LOG.debug("Shutting down due to EndSession request.");
-    shutdown();
+    if (livyConf.getBoolean(TEST_STUCK_END_SESSION)) {
+      LOG.warn("Ignoring EndSession request because TEST_STUCK_END_SESSION is set.");
+    } else {
+      LOG.debug("Shutting down due to EndSession request.");
+      shutdown();
+    }
   }
 
   public void handle(ChannelHandlerContext ctx, JobRequest<?> msg) {
@@ -377,7 +409,7 @@ public class RSCDriver extends BaseProtocol {
 
   public void handle(ChannelHandlerContext ctx, BypassJobRequest msg) throws Exception {
     LOG.info("Received bypass job request {}", msg.id);
-    BypassJobWrapper wrapper = new BypassJobWrapper(this, msg.id, msg.serializedJob);
+    BypassJobWrapper wrapper = createWrapper(msg);
     bypassJobs.add(wrapper);
     activeJobs.put(msg.id, wrapper);
     if (msg.synchronous) {
@@ -391,6 +423,10 @@ public class RSCDriver extends BaseProtocol {
     } else {
       submit(wrapper);
     }
+  }
+
+  protected BypassJobWrapper createWrapper(BypassJobRequest msg) throws Exception {
+    return new BypassJobWrapper(this, msg.id, new BypassJob(this.serializer(), msg.serializedJob));
   }
 
   @SuppressWarnings("unchecked")
@@ -432,5 +468,43 @@ public class RSCDriver extends BaseProtocol {
     }
   }
 
-}
+  protected void addFile(String path) {
+    jc.sc().addFile(path);
+  }
 
+  protected void addJarOrPyFile(String path) throws Exception {
+    File localCopyDir = new File(jc.getLocalTmpDir(), "__livy__");
+    File localCopy = copyFileToLocal(localCopyDir, path, jc.sc().sc());
+    addLocalFileToClassLoader(localCopy);
+    jc.sc().addJar(path);
+  }
+
+  public void addLocalFileToClassLoader(File localCopy) throws MalformedURLException {
+    MutableClassLoader cl = (MutableClassLoader) Thread.currentThread().getContextClassLoader();
+    cl.addURL(localCopy.toURI().toURL());
+  }
+
+  public File copyFileToLocal(
+      File localCopyDir,
+      String filePath,
+      SparkContext sc) throws Exception {
+    synchronized (jc) {
+      if (!localCopyDir.isDirectory() && !localCopyDir.mkdir()) {
+        throw new IOException("Failed to create directory to add pyFile");
+      }
+    }
+    URI uri = new URI(filePath);
+    String name = uri.getFragment() != null ? uri.getFragment() : uri.getPath();
+    name = new File(name).getName();
+    File localCopy = new File(localCopyDir, name);
+
+    if (localCopy.exists()) {
+      throw new IOException(String.format("A file with name %s has " +
+              "already been uploaded.", name));
+    }
+    Configuration conf = sc.hadoopConfiguration();
+    FileSystem fs = FileSystem.get(uri, conf);
+    fs.copyToLocalFile(new Path(uri), new Path(localCopy.toURI()));
+    return localCopy;
+  }
+}

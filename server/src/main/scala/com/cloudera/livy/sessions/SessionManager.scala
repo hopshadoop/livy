@@ -24,26 +24,71 @@ import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable
 import scala.concurrent.{Await, ExecutionContext, Future}
 import scala.concurrent.duration.Duration
+import scala.reflect.ClassTag
+import scala.util.control.NonFatal
 
 import com.cloudera.livy.{LivyConf, Logging}
+import com.cloudera.livy.server.batch.{BatchRecoveryMetadata, BatchSession}
+import com.cloudera.livy.server.interactive.{InteractiveRecoveryMetadata, InteractiveSession, SessionHeartbeatWatchdog}
+import com.cloudera.livy.server.recovery.SessionStore
+import com.cloudera.livy.sessions.Session.RecoveryMetadata
 
 object SessionManager {
-  val SESSION_TIMEOUT = LivyConf.Entry("livy.server.session.timeout", "1h")
+  val SESSION_RECOVERY_MODE_OFF = "off"
+  val SESSION_RECOVERY_MODE_RECOVERY = "recovery"
 }
 
-class SessionManager[S <: Session](val livyConf: LivyConf) extends Logging {
+class BatchSessionManager(
+    livyConf: LivyConf,
+    sessionStore: SessionStore,
+    mockSessions: Option[Seq[BatchSession]] = None)
+  extends SessionManager[BatchSession, BatchRecoveryMetadata] (
+    livyConf, BatchSession.recover(_, livyConf, sessionStore), sessionStore, "batch", mockSessions)
 
-  private implicit def executor: ExecutionContext = ExecutionContext.global
+class InteractiveSessionManager(
+  livyConf: LivyConf,
+  sessionStore: SessionStore,
+  mockSessions: Option[Seq[InteractiveSession]] = None)
+  extends SessionManager[InteractiveSession, InteractiveRecoveryMetadata] (
+    livyConf,
+    InteractiveSession.recover(_, livyConf, sessionStore),
+    sessionStore,
+    "interactive",
+    mockSessions)
+  with SessionHeartbeatWatchdog[InteractiveSession, InteractiveRecoveryMetadata]
+  {
+    start()
+  }
 
-  private[this] final val idCounter = new AtomicInteger()
-  private[this] final val sessions = mutable.Map[Int, S]()
+class SessionManager[S <: Session, R <: RecoveryMetadata : ClassTag](
+    protected val livyConf: LivyConf,
+    sessionRecovery: R => S,
+    sessionStore: SessionStore,
+    sessionType: String,
+    mockSessions: Option[Seq[S]] = None)
+  extends Logging {
 
+  import SessionManager._
+
+  protected implicit def executor: ExecutionContext = ExecutionContext.global
+
+  protected[this] final val idCounter = new AtomicInteger(0)
+  protected[this] final val sessions = mutable.LinkedHashMap[Int, S]()
+
+  private[this] final val sessionTimeoutCheck = livyConf.getBoolean(LivyConf.SESSION_TIMEOUT_CHECK)
   private[this] final val sessionTimeout =
-    TimeUnit.MILLISECONDS.toNanos(livyConf.getTimeAsMs(SessionManager.SESSION_TIMEOUT))
+    TimeUnit.MILLISECONDS.toNanos(livyConf.getTimeAsMs(LivyConf.SESSION_TIMEOUT))
+  private[this] final val sessionStateRetainedInSec =
+    TimeUnit.MILLISECONDS.toNanos(livyConf.getTimeAsMs(LivyConf.SESSION_STATE_RETAIN_TIME))
 
+  mockSessions.getOrElse(recover()).foreach(register)
   new GarbageCollector().start()
 
-  def nextId(): Int = idCounter.getAndIncrement()
+  def nextId(): Int = synchronized {
+    val id = idCounter.getAndIncrement()
+    sessionStore.saveNextSessionId(sessionType, idCounter.get())
+    id
+  }
 
   def register(session: S): S = {
     info(s"Registering new session ${session.id}")
@@ -65,26 +110,67 @@ class SessionManager[S <: Session](val livyConf: LivyConf) extends Logging {
 
   def delete(session: S): Future[Unit] = {
     session.stop().map { case _ =>
-      synchronized {
-        sessions.remove(session.id)
+      try {
+        sessionStore.remove(sessionType, session.id)
+        synchronized {
+          sessions.remove(session.id)
+        }
+      } catch {
+        case NonFatal(e) =>
+          error("Exception was thrown during stop session:", e)
+          throw e
       }
     }
   }
 
   def shutdown(): Unit = {
-    // TODO: if recovery or HA is available, sessions should not be stopped.
-    sessions.values.map(_.stop).foreach { future =>
-      Await.ready(future, Duration.Inf)
+    val recoveryEnabled = livyConf.get(LivyConf.RECOVERY_MODE) != SESSION_RECOVERY_MODE_OFF
+    if (!recoveryEnabled) {
+      sessions.values.map(_.stop).foreach { future =>
+        Await.ready(future, Duration.Inf)
+      }
     }
   }
 
   def collectGarbage(): Future[Iterable[Unit]] = {
     def expired(session: Session): Boolean = {
-      val currentTime = System.nanoTime()
-      currentTime - session.lastActivity > math.max(sessionTimeout, session.timeout)
+      session.state match {
+        case s: FinishedSessionState =>
+          val currentTime = System.nanoTime()
+          currentTime - s.time > sessionStateRetainedInSec
+        case _ =>
+          if (!sessionTimeoutCheck) {
+            false
+          } else if (session.isInstanceOf[BatchSession]) {
+            false
+          } else {
+            val currentTime = System.nanoTime()
+            currentTime - session.lastActivity > sessionTimeout
+          }
+      }
     }
 
     Future.sequence(all().filter(expired).map(delete))
+  }
+
+  private def recover(): Seq[S] = {
+    // Recover next session id from state store and create SessionManager.
+    idCounter.set(sessionStore.getNextSessionId(sessionType))
+
+    // Retrieve session recovery metadata from state store.
+    val sessionMetadata = sessionStore.getAllSessions[R](sessionType)
+
+    // Recover session from session recovery metadata.
+    val recoveredSessions = sessionMetadata.flatMap(_.toOption).map(sessionRecovery)
+
+    info(s"Recovered ${recoveredSessions.length} $sessionType sessions." +
+      s" Next session id: $idCounter")
+
+    // Print recovery error.
+    val recoveryFailure = sessionMetadata.filter(_.isFailure).map(_.failed.get)
+    recoveryFailure.foreach(ex => error(ex.getMessage, ex.getCause))
+
+    recoveredSessions
   }
 
   private class GarbageCollector extends Thread("session gc thread") {

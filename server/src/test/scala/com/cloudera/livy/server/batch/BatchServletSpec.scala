@@ -21,15 +21,21 @@ package com.cloudera.livy.server.batch
 import java.io.FileWriter
 import java.nio.file.{Files, Path}
 import java.util.concurrent.TimeUnit
+import javax.servlet.http.HttpServletRequest
 import javax.servlet.http.HttpServletResponse._
 
 import scala.concurrent.duration.Duration
 
+import org.mockito.Mockito._
+import org.scalatest.mock.MockitoSugar.mock
+
 import com.cloudera.livy.Utils
 import com.cloudera.livy.server.BaseSessionServletSpec
-import com.cloudera.livy.sessions.SessionState
+import com.cloudera.livy.server.recovery.SessionStore
+import com.cloudera.livy.sessions.{BatchSessionManager, SessionState}
+import com.cloudera.livy.utils.AppInfo
 
-class BatchServletSpec extends BaseSessionServletSpec[BatchSession] {
+class BatchServletSpec extends BaseSessionServletSpec[BatchSession, BatchRecoveryMetadata] {
 
   val script: Path = {
     val script = Files.createTempFile("livy-test", ".py")
@@ -46,7 +52,14 @@ class BatchServletSpec extends BaseSessionServletSpec[BatchSession] {
     script
   }
 
-  override def createServlet(): BatchSessionServlet = new BatchSessionServlet(createConf())
+  override def createServlet(): BatchSessionServlet = {
+    val livyConf = createConf()
+    val sessionStore = mock[SessionStore]
+    new BatchSessionServlet(
+      new BatchSessionManager(livyConf, sessionStore, Some(Seq.empty)),
+      sessionStore,
+      livyConf)
+  }
 
   describe("Batch Servlet") {
     it("should create and tear down a batch") {
@@ -107,6 +120,31 @@ class BatchServletSpec extends BaseSessionServletSpec[BatchSession] {
       jpost[Map[String, Any]]("/", createRequest, expectedStatus = SC_BAD_REQUEST) { _ => }
     }
 
+    it("should show session properties") {
+      val id = 0
+      val state = SessionState.Running()
+      val appId = "appid"
+      val appInfo = AppInfo(Some("DRIVER LOG URL"), Some("SPARK UI URL"))
+      val log = IndexedSeq[String]("log1", "log2")
+
+      val session = mock[BatchSession]
+      when(session.id).thenReturn(id)
+      when(session.state).thenReturn(state)
+      when(session.appId).thenReturn(Some(appId))
+      when(session.appInfo).thenReturn(appInfo)
+      when(session.logLines()).thenReturn(log)
+
+      val req = mock[HttpServletRequest]
+
+      val view = servlet.asInstanceOf[BatchSessionServlet].clientSessionView(session, req)
+        .asInstanceOf[BatchSessionView]
+
+      view.id shouldEqual id
+      view.state shouldEqual state.toString
+      view.appId shouldEqual Some(appId)
+      view.appInfo shouldEqual appInfo
+      view.log shouldEqual log
+    }
   }
 
 }

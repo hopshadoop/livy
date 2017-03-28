@@ -22,8 +22,12 @@ package com.cloudera.livy.server
 import javax.servlet.http.HttpServletRequest
 import javax.servlet.http.HttpServletResponse._
 
+import org.scalatest.mock.MockitoSugar.mock
+
 import com.cloudera.livy.LivyConf
-import com.cloudera.livy.sessions.{Session, SessionState}
+import com.cloudera.livy.server.recovery.SessionStore
+import com.cloudera.livy.sessions.{Session, SessionManager, SessionState}
+import com.cloudera.livy.sessions.Session.RecoveryMetadata
 
 object SessionServletSpec {
 
@@ -32,7 +36,11 @@ object SessionServletSpec {
   class MockSession(id: Int, owner: String, livyConf: LivyConf)
     extends Session(id, owner, livyConf) {
 
+    case class MockRecoveryMetadata(id: Int) extends RecoveryMetadata()
+
     override val proxyUser = None
+
+    override def recoveryMetadata: RecoveryMetadata = MockRecoveryMetadata(0)
 
     override def state: SessionState = SessionState.Idle()
 
@@ -47,13 +55,20 @@ object SessionServletSpec {
 }
 
 class SessionServletSpec
-  extends BaseSessionServletSpec[Session] {
+  extends BaseSessionServletSpec[Session, RecoveryMetadata] {
 
   import SessionServletSpec._
 
-  override def createServlet(): SessionServlet[Session] = {
+  override def createServlet(): SessionServlet[Session, RecoveryMetadata] = {
     val conf = createConf()
-    new SessionServlet[Session](conf) with RemoteUserOverride {
+    val sessionManager = new SessionManager[Session, RecoveryMetadata](
+      conf,
+      { _ => assert(false).asInstanceOf[Session] },
+      mock[SessionStore],
+      "test",
+      Some(Seq.empty))
+
+    new SessionServlet(sessionManager, conf) with RemoteUserOverride {
       override protected def createSession(req: HttpServletRequest): Session = {
         val params = bodyAs[Map[String, String]](req)
         checkImpersonation(params.get(PROXY_USER), req)
@@ -79,6 +94,17 @@ class SessionServletSpec
   }
 
   describe("SessionServlet") {
+
+    it("should return correct Location in header") {
+      // mount to "/sessions/*" to test. If request URI is "/session", getPathInfo() will
+      // return null, since there's no extra path.
+      // mount to "/*" will always return "/", so that it cannot reflect the issue.
+      addServlet(servlet, "/sessions/*")
+      jpost[MockSessionView]("/sessions", Map(), headers = aliceHeaders) { res =>
+        assert(header("Location") === "/sessions/0")
+        jdelete[Map[String, Any]]("/sessions/0", SC_OK, aliceHeaders) { _ => }
+      }
+    }
 
     it("should attach owner information to sessions") {
       jpost[MockSessionView]("/", Map(), headers = aliceHeaders) { res =>

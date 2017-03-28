@@ -31,7 +31,7 @@ class SparkProcessBuilder(livyConf: LivyConf) extends Logging {
   private[this] var _master: Option[String] = None
   private[this] var _deployMode: Option[String] = None
   private[this] var _className: Option[String] = None
-  private[this] var _name: Option[String] = Some("Livy")
+  private[this] var _name: Option[String] = None
   private[this] val _conf = mutable.HashMap[String, String]()
   private[this] var _driverClassPath: ArrayBuffer[String] = ArrayBuffer()
   private[this] var _proxyUser: Option[String] = None
@@ -178,8 +178,13 @@ class SparkProcessBuilder(livyConf: LivyConf) extends Logging {
     addOpt("--name", _name)
     addOpt("--class", _className)
     _conf.foreach { case (key, value) =>
-      arguments += "--conf"
-      arguments += f"$key=$value"
+      if (key == "spark.submit.pyFiles") {
+         arguments += "--py-files"
+         arguments += f"$value"
+      } else {
+         arguments += "--conf"
+         arguments += f"$key=$value"
+      }
     }
     addList("--driver-class-path", _driverClassPath)
 

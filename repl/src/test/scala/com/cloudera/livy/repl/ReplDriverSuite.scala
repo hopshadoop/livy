@@ -34,7 +34,7 @@ import com.cloudera.livy._
 import com.cloudera.livy.rsc.{PingJob, RSCClient, RSCConf}
 import com.cloudera.livy.sessions.Spark
 
-class ReplDriverSuite extends FunSuite {
+class ReplDriverSuite extends FunSuite with LivyBaseUnitTestSuite {
 
   private implicit val formats = DefaultFormats
 
@@ -52,18 +52,17 @@ class ReplDriverSuite extends FunSuite {
 
     try {
       // This is sort of what InteractiveSession.scala does to detect an idle session.
-      val handle = client.submit(new PingJob()).get(30, TimeUnit.SECONDS)
+      client.submit(new PingJob()).get(60, TimeUnit.SECONDS)
 
-      assert(client.getReplState().get(10, TimeUnit.SECONDS) === "idle")
-
-      val statementId = client.submitReplCode("1 + 1")
+      val statementId = client.submitReplCode("1 + 1").get
       eventually(timeout(30 seconds), interval(100 millis)) {
-        val rawResult = client.getReplJobResult(statementId).get(10, TimeUnit.SECONDS)
-        val result = parse(rawResult)
-        assert((result \ Session.STATUS).extract[String] === Session.OK)
+        val rawResult =
+          client.getReplJobResults(statementId, 1).get(10, TimeUnit.SECONDS).statements(0)
+        val result = rawResult.output
+        assert((parse(result) \ Session.STATUS).extract[String] === Session.OK)
       }
     } finally {
-      client.stop(true);
+      client.stop(true)
     }
   }
 

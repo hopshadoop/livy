@@ -28,16 +28,21 @@ import scala.collection.JavaConverters._
 import scala.reflect.runtime.universe
 
 import org.apache.commons.codec.binary.Base64
+import org.apache.commons.lang.StringEscapeUtils
 import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.util.{ChildFirstURLClassLoader, MutableURLClassLoader, Utils}
 import org.json4s._
 import org.json4s.JsonDSL._
 
 import com.cloudera.livy.client.common.ClientConf
+import com.cloudera.livy.rsc.RSCConf
+
+private case class RequestResponse(content: String, error: Boolean)
 
 // scalastyle:off println
 object SparkRInterpreter {
   private val LIVY_END_MARKER = "----LIVY_END_OF_COMMAND----"
+  private val LIVY_ERROR_MARKER = "----LIVY_END_OF_ERROR----"
   private val PRINT_MARKER = f"""print("$LIVY_END_MARKER")"""
   private val EXPECTED_OUTPUT = f"""[1] "$LIVY_END_MARKER""""
 
@@ -63,7 +68,7 @@ object SparkRInterpreter {
     ")"
     ).r.unanchored
 
-  def apply(conf: SparkConf): SparkRInterpreter = {
+  def apply(conf: SparkConf, listener: StatementProgressListener): SparkRInterpreter = {
     val backendTimeout = sys.env.getOrElse("SPARKR_BACKEND_TIMEOUT", "120").toInt
     val mirror = universe.runtimeMirror(getClass.getClassLoader)
     val sparkRBackendClass = mirror.classLoader.loadClass("org.apache.spark.api.r.RBackend")
@@ -87,10 +92,13 @@ object SparkRInterpreter {
     try {
       // Wait for RBackend initialization to finish
       initialized.tryAcquire(backendTimeout, TimeUnit.SECONDS)
-      val rExec = sys.env.getOrElse("DRIVER_R", "R")
+      val rExec = conf.getOption("spark.r.shell.command")
+        .orElse(sys.env.get("SPARKR_DRIVER_R"))
+        .getOrElse("R")
+
       var packageDir = ""
       if (sys.env.getOrElse("SPARK_YARN_MODE", "") == "true") {
-        packageDir = "./sparkr.zip"
+        packageDir = "./sparkr"
       } else {
         // local mode
         val rLibPath = new File(sys.env.getOrElse("SPARKR_PACKAGE_DIR",
@@ -109,9 +117,12 @@ object SparkRInterpreter {
       env.put("R_PROFILE_USER",
         Seq(packageDir, "SparkR", "profile", "general.R").mkString(File.separator))
 
-      builder.redirectError(Redirect.PIPE)
+      builder.redirectErrorStream(true)
       val process = builder.start()
-      new SparkRInterpreter(process, backendInstance, backendThread)
+      new SparkRInterpreter(process, backendInstance, backendThread,
+        conf.get("spark.livy.spark_major_version", "1"),
+        conf.getBoolean("spark.repl.enableHiveContext", false),
+        listener)
     } catch {
       case e: Exception =>
         if (backendThread != null) {
@@ -122,23 +133,43 @@ object SparkRInterpreter {
   }
 }
 
-class SparkRInterpreter(process: Process, backendInstance: Any, backendThread: Thread)
-  extends ProcessInterpreter(process)
-{
+class SparkRInterpreter(process: Process,
+    backendInstance: Any,
+    backendThread: Thread,
+    val sparkMajorVersion: String,
+    hiveEnabled: Boolean,
+    statementProgressListener: StatementProgressListener)
+  extends ProcessInterpreter(process, statementProgressListener) {
   import SparkRInterpreter._
 
   implicit val formats = DefaultFormats
 
   private[this] var executionCount = 0
-  override def kind: String = "sparkR"
-  private[this] val isStarted = new CountDownLatch(1);
+  override def kind: String = "sparkr"
+  private[this] val isStarted = new CountDownLatch(1)
 
   final override protected def waitUntilReady(): Unit = {
     // Set the option to catch and ignore errors instead of halting.
     sendRequest("options(error = dump.frames)")
     if (!ClientConf.TEST_MODE) {
       sendRequest("library(SparkR)")
-      sendRequest("sc <- sparkR.init()")
+      if (sparkMajorVersion >= "2") {
+        if (hiveEnabled) {
+          sendRequest("spark <- SparkR::sparkR.session()")
+        } else {
+          sendRequest("spark <- SparkR::sparkR.session(enableHiveSupport=FALSE)")
+        }
+        sendRequest(
+          """sc <- SparkR:::callJStatic("org.apache.spark.sql.api.r.SQLUtils",
+            "getJavaSparkContext", spark)""")
+      } else {
+        sendRequest("sc <- sparkR.init()")
+        if (hiveEnabled) {
+          sendRequest("sqlContext <- sparkRHive.init(sc)")
+        } else {
+          sendRequest("sqlContext <- sparkRSQL.init(sc)")
+        }
+      }
     }
 
     isStarted.countDown()
@@ -160,38 +191,46 @@ class SparkRInterpreter(process: Process, backendInstance: Any, backendThread: T
     }
 
     try {
-      var content: JObject = TEXT_PLAIN -> (sendRequest(code) + takeErrorLines())
+      val response = sendRequest(code)
 
-      // If we rendered anything, pass along the last image.
-      tempFile.foreach { case file =>
-        val bytes = Files.readAllBytes(file)
-        if (bytes.nonEmpty) {
-          val image = Base64.encodeBase64String(bytes)
-          content = content ~ (IMAGE_PNG -> image)
+      if (response.error) {
+        Interpreter.ExecuteError("Error", response.content)
+      } else {
+        var content: JObject = TEXT_PLAIN -> response.content
+
+        // If we rendered anything, pass along the last image.
+        tempFile.foreach { case file =>
+          val bytes = Files.readAllBytes(file)
+          if (bytes.nonEmpty) {
+            val image = Base64.encodeBase64String(bytes)
+            content = content ~ (IMAGE_PNG -> image)
+          }
         }
+
+        Interpreter.ExecuteSuccess(content)
       }
 
-      Interpreter.ExecuteSuccess(content)
     } catch {
       case e: Error =>
-        val message = Seq(e.output, takeErrorLines()).mkString("\n")
-        Interpreter.ExecuteError("Error", message)
+        Interpreter.ExecuteError("Error", e.output)
       case e: Exited =>
-        Interpreter.ExecuteAborted(takeErrorLines())
+        Interpreter.ExecuteAborted(e.getMessage)
     } finally {
       tempFile.foreach(Files.delete)
     }
 
   }
 
-  private def sendRequest(code: String): String = {
-    stdin.println(code)
+  private def sendRequest(code: String): RequestResponse = {
+    stdin.println(s"""tryCatch(eval(parse(text="${StringEscapeUtils.escapeJava(code)}"))
+                     |,error = function(e) sprintf("%s%s", e, "${LIVY_ERROR_MARKER}"))
+                  """.stripMargin)
     stdin.flush()
 
     stdin.println(PRINT_MARKER)
     stdin.flush()
 
-    readTo(EXPECTED_OUTPUT)
+    readTo(EXPECTED_OUTPUT, LIVY_ERROR_MARKER)
   }
 
   override protected def sendShutdownRequest() = {
@@ -215,7 +254,10 @@ class SparkRInterpreter(process: Process, backendInstance: Any, backendThread: T
   }
 
   @tailrec
-  private def readTo(marker: String, output: StringBuilder = StringBuilder.newBuilder): String = {
+  private def readTo(
+      marker: String,
+      errorMarker: String,
+      output: StringBuilder = StringBuilder.newBuilder): RequestResponse = {
     var char = readChar(output)
 
     // Remove any ANSI color codes which match the pattern "\u001b\\[[0-9;]*[mG]".
@@ -232,13 +274,23 @@ class SparkRInterpreter(process: Process, backendInstance: Any, backendThread: T
     }
 
     if (output.endsWith(marker)) {
-      val result = output.toString()
-      result.substring(0, result.length - marker.length)
-        .stripPrefix("\n")
-        .stripSuffix("\n")
+      var result = stripMarker(output.toString(), marker)
+
+      if (result.endsWith(errorMarker + "\"")) {
+        result = stripMarker(result, "\\n" + errorMarker)
+        RequestResponse(result, error = true)
+      } else {
+        RequestResponse(result, error = false)
+      }
     } else {
-      readTo(marker, output)
+      readTo(marker, errorMarker, output)
     }
+  }
+
+  private def stripMarker(result: String, marker: String): String = {
+    result.replace(marker, "")
+      .stripPrefix("\n")
+      .stripSuffix("\n")
   }
 
   private def readChar(output: StringBuilder): Char = {

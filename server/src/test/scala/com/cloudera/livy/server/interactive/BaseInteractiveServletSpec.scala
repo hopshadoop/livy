@@ -29,7 +29,8 @@ import com.cloudera.livy.rsc.RSCConf
 import com.cloudera.livy.server.BaseSessionServletSpec
 import com.cloudera.livy.sessions.{Kind, SessionKindModule, Spark}
 
-abstract class BaseInteractiveServletSpec extends BaseSessionServletSpec[InteractiveSession] {
+abstract class BaseInteractiveServletSpec
+  extends BaseSessionServletSpec[InteractiveSession, InteractiveRecoveryMetadata] {
 
   mapper.registerModule(new SessionKindModule())
 
@@ -49,7 +50,9 @@ abstract class BaseInteractiveServletSpec extends BaseSessionServletSpec[Interac
     }
     super.createConf()
       .set(LivyConf.SESSION_STAGING_DIR, tempDir.toURI().toString())
-      .set(InteractiveSession.LivyReplJars, "")
+      .set(LivyConf.REPL_JARS, "dummy.jar")
+      .set(LivyConf.LIVY_SPARK_VERSION, "1.6.0")
+      .set(LivyConf.LIVY_SPARK_SCALA_VERSION, "2.10.5")
   }
 
   protected def createRequest(

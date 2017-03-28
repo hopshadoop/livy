@@ -48,6 +48,7 @@ import org.apache.spark.launcher.SparkLauncher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.cloudera.livy.client.common.TestUtils;
 import com.cloudera.livy.rsc.driver.RSCDriverBootstrapper;
 import com.cloudera.livy.rsc.rpc.Rpc;
 import com.cloudera.livy.rsc.rpc.RpcDispatcher;
@@ -63,14 +64,15 @@ class ContextLauncher {
   private static final Logger LOG = LoggerFactory.getLogger(ContextLauncher.class);
   private static final AtomicInteger CHILD_IDS = new AtomicInteger();
 
+  private static final String SPARK_DEPLOY_MODE = "spark.submit.deployMode";
   private static final String SPARK_JARS_KEY = "spark.jars";
   private static final String SPARK_ARCHIVES_KEY = "spark.yarn.dist.archives";
   private static final String SPARK_HOME_ENV = "SPARK_HOME";
 
-  static Promise<ContextInfo> create(RSCClientFactory factory, RSCConf conf)
+  static DriverProcessInfo create(RSCClientFactory factory, RSCConf conf)
       throws IOException {
     ContextLauncher launcher = new ContextLauncher(factory, conf);
-    return launcher.promise;
+    return new DriverProcessInfo(launcher.promise, launcher.child.child);
   }
 
   private final Promise<ContextInfo> promise;
@@ -98,6 +100,17 @@ class ContextLauncher {
       conf.set(LAUNCHER_PORT, factory.getServer().getPort());
       conf.set(CLIENT_ID, clientId);
       conf.set(CLIENT_SECRET, secret);
+
+      Utils.addListener(promise, new FutureListener<ContextInfo>() {
+        @Override
+        public void onFailure(Throwable error) throws Exception {
+          // If promise is cancelled or failed, make sure spark-submit is not leaked.
+          if (child != null) {
+            child.kill();
+          }
+        }
+      });
+
       this.child = startDriver(conf, promise);
 
       // Set up a timeout to fail the promise if we don't hear back from the context
@@ -126,10 +139,12 @@ class ContextLauncher {
   private void dispose(boolean forceKill) {
     factory.getServer().unregisterClient(clientId);
     try {
-      if (forceKill) {
-        child.kill();
-      } else {
-        child.detach();
+      if (child != null) {
+        if (forceKill) {
+          child.kill();
+        } else {
+          child.detach();
+        }
       }
     } finally {
       factory.unref();
@@ -172,18 +187,25 @@ class ContextLauncher {
     // of "small" Java processes lingering on the Livy server node.
     conf.set("spark.yarn.submit.waitAppCompletion", "false");
 
-    // For testing; propagate jacoco settings so that we also do coverage analysis
-    // on the launched driver. We replace the name of the main file ("main.exec")
-    // so that we don't end up fighting with the main test launcher.
-    String jacocoArgs = System.getProperty("jacoco.args");
-    if (jacocoArgs != null) {
-      jacocoArgs = jacocoArgs.replace("main.exec", "child.exec");
-      merge(conf, SparkLauncher.DRIVER_EXTRA_JAVA_OPTIONS, jacocoArgs, " ");
+    if (!conf.getBoolean(CLIENT_IN_PROCESS) &&
+        // For tests which doesn't shutdown RscDriver gracefully, JaCoCo exec isn't dumped properly.
+        // Disable JaCoCo for this case.
+        !conf.getBoolean(TEST_STUCK_END_SESSION)) {
+      // For testing; propagate jacoco settings so that we also do coverage analysis
+      // on the launched driver. We replace the name of the main file ("main.exec")
+      // so that we don't end up fighting with the main test launcher.
+      String jacocoArgs = TestUtils.getJacocoArgs();
+      if (jacocoArgs != null) {
+        merge(conf, SparkLauncher.DRIVER_EXTRA_JAVA_OPTIONS, jacocoArgs, " ");
+      }
     }
 
     final File confFile = writeConfToFile(conf);
 
-    if (conf.getBoolean(CLIENT_IN_PROCESS)) {
+    if (ContextLauncher.mockSparkSubmit != null) {
+      LOG.warn("!!!! Using mock spark-submit. !!!!");
+      return new ChildProcess(conf, promise, ContextLauncher.mockSparkSubmit, confFile);
+    } else if (conf.getBoolean(CLIENT_IN_PROCESS)) {
       // Mostly for testing things quickly. Do not do this in production.
       LOG.warn("!!!! Running remote driver in-process. !!!!");
       Runnable child = new Runnable() {
@@ -199,6 +221,13 @@ class ContextLauncher {
       return new ChildProcess(conf, promise, child, confFile);
     } else {
       final SparkLauncher launcher = new SparkLauncher();
+
+      // Spark 1.x does not support specifying deploy mode in conf and needs special handling.
+      String deployMode = conf.get(SPARK_DEPLOY_MODE);
+      if (deployMode != null) {
+        launcher.setDeployMode(deployMode);
+      }
+
       launcher.setSparkHome(System.getenv(SPARK_HOME_ENV));
       launcher.setAppResource("spark-internal");
       launcher.setPropertiesFile(confFile.getAbsolutePath());
@@ -275,33 +304,6 @@ class ContextLauncher {
     return file;
   }
 
-  private static class Redirector implements Runnable {
-
-    private final BufferedReader in;
-
-    Redirector(InputStream in) {
-      this.in = new BufferedReader(new InputStreamReader(in));
-    }
-
-    @Override
-    public void run() {
-      try {
-        String line = null;
-        while ((line = in.readLine()) != null) {
-          LOG.info(line);
-        }
-      } catch (Exception e) {
-        LOG.warn("Error in redirector thread.", e);
-      }
-
-      try {
-        in.close();
-      } catch (IOException ioe) {
-        LOG.warn("Error closing child stream.", ioe);
-      }
-    }
-
-  }
 
   private class RegistrationHandler extends BaseProtocol
     implements RpcServer.ClientCallback {
@@ -315,6 +317,10 @@ class ContextLauncher {
       LOG.debug("New RPC client connected from {}.", client.getChannel());
       this.client = client;
       return this;
+    }
+
+    @Override
+    public void onSaslComplete(Rpc client) {
     }
 
     void dispose() {
@@ -350,8 +356,6 @@ class ContextLauncher {
     private final Promise<?> promise;
     private final Process child;
     private final Thread monitor;
-    private final Thread stdout;
-    private final Thread stderr;
     private final File confFile;
 
     public ChildProcess(RSCConf conf, Promise<?> promise, Runnable child, File confFile) {
@@ -359,8 +363,6 @@ class ContextLauncher {
       this.promise = promise;
       this.monitor = monitor(child, CHILD_IDS.incrementAndGet());
       this.child = null;
-      this.stdout = null;
-      this.stderr = null;
       this.confFile = confFile;
     }
 
@@ -369,8 +371,6 @@ class ContextLauncher {
       this.conf = conf;
       this.promise = promise;
       this.child = childProc;
-      this.stdout = redirect("stdout-redir-" + childId, child.getInputStream());
-      this.stderr = redirect("stderr-redir-" + childId, child.getErrorStream());
       this.confFile = confFile;
 
       Runnable monitorTask = new Runnable() {
@@ -417,36 +417,11 @@ class ContextLauncher {
     }
 
     public void detach() {
-      if (stdout != null) {
-        stdout.interrupt();
-        try {
-          stdout.join(conf.getTimeAsMs(CLIENT_SHUTDOWN_TIMEOUT));
-        } catch (InterruptedException ie) {
-          LOG.info("Interrupted while waiting for child stdout to finish.");
-        }
-      }
-      if (stderr != null) {
-        stderr.interrupt();
-        try {
-          stderr.join(conf.getTimeAsMs(CLIENT_SHUTDOWN_TIMEOUT));
-        } catch (InterruptedException ie) {
-          LOG.info("Interrupted while waiting for child stderr to finish.");
-        }
-      }
-
       try {
         monitor.join(conf.getTimeAsMs(CLIENT_SHUTDOWN_TIMEOUT));
       } catch (InterruptedException ie) {
         LOG.debug("Interrupted before driver thread was finished.");
       }
-    }
-
-    private Thread redirect(String name, InputStream in) {
-      Thread thread = new Thread(new Redirector(in));
-      thread.setName(name);
-      thread.setDaemon(true);
-      thread.start();
-      return thread;
     }
 
     private Thread monitor(final Runnable task, int childId) {
@@ -474,5 +449,8 @@ class ContextLauncher {
       return thread;
     }
   }
+
+  // Just for testing.
+  static Process mockSparkSubmit;
 
 }

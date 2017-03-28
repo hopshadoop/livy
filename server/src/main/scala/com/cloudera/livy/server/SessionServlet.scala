@@ -20,12 +20,13 @@ package com.cloudera.livy.server
 
 import javax.servlet.http.HttpServletRequest
 
-import scala.concurrent.Future
-
 import org.scalatra._
+import scala.concurrent._
+import scala.concurrent.duration._
 
 import com.cloudera.livy.{LivyConf, Logging}
 import com.cloudera.livy.sessions.{Session, SessionManager}
+import com.cloudera.livy.sessions.Session.RecoveryMetadata
 
 object SessionServlet extends Logging
 
@@ -36,15 +37,15 @@ object SessionServlet extends Logging
  * Type parameters:
  *  S: the session type
  */
-abstract class SessionServlet[S <: Session](livyConf: LivyConf)
+abstract class SessionServlet[S <: Session, R <: RecoveryMetadata](
+    private[livy] val sessionManager: SessionManager[S, R],
+    livyConf: LivyConf)
   extends JsonServlet
   with ApiVersioningSupport
   with MethodOverride
   with UrlGeneratorSupport
+  with GZipSupport
 {
-
-  private[livy] val sessionManager = new SessionManager[S](livyConf)
-
   /**
    * Creates a new session based on the current request. The implementation is responsible for
    * parsing the body of the request.
@@ -106,33 +107,28 @@ abstract class SessionServlet[S <: Session](livyConf: LivyConf)
   delete("/:id") {
     withSession { session =>
       sessionManager.delete(session.id) match {
-      case Some(future) =>
-        new AsyncResult {
-          val is = future.map { case () => Ok(Map("msg" -> "deleted")) }
-        }
-      case None =>
-        NotFound(s"Session ${session.id} already stopped.")
+        case Some(future) =>
+          Await.ready(future, Duration.Inf)
+          Ok(Map("msg" -> "deleted"))
+
+        case None =>
+          NotFound(s"Session ${session.id} already stopped.")
       }
     }
   }
 
   post("/") {
-    new AsyncResult {
-      val is = Future {
-        val session = sessionManager.register(createSession(request))
-        // Because it may take some time to establish the session, update the last activity
-        // time before returning the session info to the client.
-        session.recordActivity()
-        Created(clientSessionView(session, request),
-          headers = Map("Location" ->
-            (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString)))
-        )
-      }
-    }
+    val session = sessionManager.register(createSession(request))
+    // Because it may take some time to establish the session, update the last activity
+    // time before returning the session info to the client.
+    session.recordActivity()
+    Created(clientSessionView(session, request),
+      headers = Map("Location" ->
+        (getRequestPathInfo(request) + url(getSession, "id" -> session.id.toString))))
   }
 
   private def getRequestPathInfo(request: HttpServletRequest): String = {
-    if (request.getPathInfo != "/") {
+    if (request.getPathInfo != null && request.getPathInfo != "/") {
       request.getPathInfo
     } else {
       ""
@@ -141,15 +137,6 @@ abstract class SessionServlet[S <: Session](livyConf: LivyConf)
 
   error {
     case e: IllegalArgumentException => BadRequest(e.getMessage)
-    case e =>
-      SessionServlet.error("internal error", e)
-      InternalServerError(e.toString)
-  }
-
-  protected def doAsync(fn: => Any): AsyncResult = {
-    new AsyncResult {
-      val is = Future { fn }
-    }
   }
 
   /**

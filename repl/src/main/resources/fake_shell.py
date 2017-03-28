@@ -14,23 +14,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import print_function
 import ast
-import cStringIO
 import datetime
 import decimal
+import io
 import json
 import logging
 import sys
 import traceback
-import StringIO
 import base64
 import os
+import re
+import threading
+import tempfile
+import shutil
+import pickle
+import textwrap
+
+if sys.version >= '3':
+    unicode = str
+else:
+    import cStringIO
+    import StringIO
 
 logging.basicConfig()
 LOG = logging.getLogger('fake_shell')
 
 global_dict = {}
+job_context = None
+local_tmp_dir_path = None
 
+TOP_FRAME_REGEX = re.compile(r'\s*File "<stdin>".*in <module>')
 
 def execute_reply(status, content):
     return {
@@ -50,10 +65,19 @@ def execute_reply_ok(data):
 
 def execute_reply_error(exc_type, exc_value, tb):
     LOG.error('execute_reply', exc_info=True)
+    if sys.version >= '3':
+      formatted_tb = traceback.format_exception(exc_type, exc_value, tb, chain=False)
+    else:
+      formatted_tb = traceback.format_exception(exc_type, exc_value, tb)
+    for i in range(len(formatted_tb)):
+        if TOP_FRAME_REGEX.match(formatted_tb[i]):
+            formatted_tb = formatted_tb[:1] + formatted_tb[i + 1:]
+            break
+
     return execute_reply('error', {
         'ename': unicode(exc_type.__name__),
         'evalue': unicode(exc_value),
-        'traceback': traceback.format_exception(exc_type, exc_value, tb, -1),
+        'traceback': formatted_tb,
     })
 
 
@@ -64,6 +88,92 @@ def execute_reply_internal_error(message, exc_info=None):
         'evalue': message,
         'traceback': [],
     })
+
+
+class JobContextImpl(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sc = global_dict['sc']
+        self.sql_ctx = global_dict['sqlContext']
+        self.hive_ctx = None
+        self.streaming_ctx = None
+        self.local_tmp_dir_path = local_tmp_dir_path
+        self.spark_session = global_dict.get('spark')
+
+    def sc(self):
+        return self.sc
+
+    def sql_ctx(self):
+        return self.sql_ctx
+
+    def hive_ctx(self):
+        if self.hive_ctx is None:
+            with self.lock:
+                if self.hive_ctx is None:
+                    if isinstance(self.sql_ctx, global_dict['HiveContext']):
+                        self.hive_ctx = self.sql_ctx
+                    else:
+                        self.hive_ctx = global_dict['HiveContext'](self.sc)
+        return self.hive_ctx
+
+    def create_streaming_ctx(self, batch_duration):
+        with self.lock:
+            if self.streaming_ctx is not None:
+                raise ValueError("Streaming context already exists")
+            self.streaming_ctx = global_dict['StreamingContext'](self.sc, batch_duration)
+
+    def streaming_ctx(self):
+        with self.lock:
+            if self.streaming_ctx is None:
+                raise ValueError("create_streaming_ctx function should be called first")
+        return self.streaming_ctx
+
+    def stop_streaming_ctx(self):
+        with self.lock:
+            if self.streaming_ctx is None:
+                raise ValueError("Cannot stop streaming context. Streaming context is None")
+            self.streaming_ctx.stop()
+            self.streaming_ctx = None
+
+    def get_local_tmp_dir_path(self):
+        return self.local_tmp_dir_path
+
+    def stop(self):
+        with self.lock:
+            if self.streaming_ctx is not None:
+                self.stop_streaming_ctx()
+            if self.sc is not None:
+                self.sc.stop()
+
+    def spark_session(self):
+        return self.spark_session
+
+
+class PySparkJobProcessorImpl(object):
+    def processBypassJob(self, serialized_job):
+        try:
+            if sys.version >= '3':
+                deserialized_job = pickle.loads(serialized_job, encoding="bytes")
+            else:
+                deserialized_job = pickle.loads(serialized_job)
+            result = deserialized_job(job_context)
+            serialized_result = global_dict['cloudpickle'].dumps(result)
+            response = bytearray(base64.b64encode(serialized_result))
+        except:
+            response = bytearray('Client job error:' + traceback.format_exc(), 'utf-8')
+        return response
+
+    def addFile(self, uri_path):
+        job_context.sc.addFile(uri_path)
+
+    def addPyFile(self, uri_path):
+        job_context.sc.addPyFile(uri_path)
+
+    def getLocalTmpDirPath(self):
+        return os.path.join(job_context.get_local_tmp_dir_path(), '__livy__')
+
+    class Scala:
+        extends = ['com.cloudera.livy.repl.PySparkJobProcessor']
 
 
 class ExecutionError(Exception):
@@ -82,12 +192,12 @@ class NormalNode(object):
             for node in to_run_exec:
                 mod = ast.Module([node])
                 code = compile(mod, '<stdin>', 'exec')
-                exec code in global_dict
+                exec(code, global_dict)
 
             for node in to_run_single:
                 mod = ast.Interactive([node])
                 code = compile(mod, '<stdin>', 'single')
-                exec code in global_dict
+                exec(code, global_dict)
         except:
             # We don't need to log the exception because we're just executing user
             # code and passing the error along.
@@ -132,12 +242,13 @@ def parse_code_into_nodes(code):
 
         # Split the code into chunks of normal code, and possibly magic code, which starts with
         # a '%'.
+
         normal = []
         chunks = []
         for i, line in enumerate(code.rstrip().split('\n')):
             if line.startswith('%'):
                 if normal:
-                    chunks.append(''.join(normal))
+                    chunks.append('\n'.join(normal))
                     normal = []
 
                 chunks.append(line)
@@ -169,7 +280,7 @@ def execute_request(content):
         nodes = parse_code_into_nodes(code)
     except SyntaxError:
         exc_type, exc_value, tb = sys.exc_info()
-        return execute_reply_error(exc_type, exc_value, [])
+        return execute_reply_error(exc_type, exc_value, None)
 
     result = None
 
@@ -178,18 +289,17 @@ def execute_request(content):
             result = node.execute()
     except UnknownMagic:
         exc_type, exc_value, tb = sys.exc_info()
-        return execute_reply_error(exc_type, exc_value, [])
-    except ExecutionError, e:
+        return execute_reply_error(exc_type, exc_value, None)
+    except ExecutionError as e:
         return execute_reply_error(*e.exc_info)
 
     if result is None:
         result = {}
 
-    stdout = fake_stdout.getvalue()
-    fake_stdout.truncate(0)
+    stdout = sys.stdout.getvalue()
+    stderr = sys.stderr.getvalue()
 
-    stderr = fake_stderr.getvalue()
-    fake_stderr.truncate(0)
+    clearOutputs()
 
     output = result.pop('text/plain', '')
 
@@ -262,10 +372,8 @@ magic_table_types = {
     type(None): lambda x: ('NULL_TYPE', x),
     bool: lambda x: ('BOOLEAN_TYPE', x),
     int: lambda x: ('INT_TYPE', x),
-    long: lambda x: ('BIGINT_TYPE', x),
     float: lambda x: ('DOUBLE_TYPE', x),
     str: lambda x: ('STRING_TYPE', str(x)),
-    unicode: lambda x: ('STRING_TYPE', x.encode('utf-8')),
     datetime.date: lambda x: ('DATE_TYPE', str(x)),
     datetime.datetime: lambda x: ('TIMESTAMP_TYPE', str(x)),
     decimal.Decimal: lambda x: ('DECIMAL_TYPE', str(x)),
@@ -274,13 +382,21 @@ magic_table_types = {
     dict: magic_table_convert_map,
 }
 
+# python 2.x only
+if sys.version < '3':
+    magic_table_types.update({
+        long: lambda x: ('BIGINT_TYPE', x),
+        unicode: lambda x: ('STRING_TYPE', x.encode('utf-8'))
+    })
+
+
 
 def magic_table(name):
     try:
         value = global_dict[name]
     except KeyError:
         exc_type, exc_value, tb = sys.exc_info()
-        return execute_reply_error(exc_type, exc_value, [])
+        return execute_reply_error(exc_type, exc_value, None)
 
     if not isinstance(value, (list, tuple)):
         value = [value]
@@ -291,6 +407,9 @@ def magic_table(name):
     for row in value:
         cols = []
         data.append(cols)
+        
+        if 'Row' == row.__class__.__name__:
+            row = row.asDict()
 
         if not isinstance(row, (list, tuple, dict)):
             row = [row]
@@ -298,7 +417,7 @@ def magic_table(name):
         if isinstance(row, (list, tuple)):
             iterator = enumerate(row)
         else:
-            iterator = sorted(row.iteritems())
+            iterator = sorted(row.items())
 
         for name, col in iterator:
             col_type, col = magic_table_convert(col)
@@ -312,15 +431,18 @@ def magic_table(name):
                 }
                 headers[name] = header
             else:
-                # Reject columns that have a different type.
-                if header['type'] != col_type:
-                    exc_type = Exception
-                    exc_value = 'table rows have different types'
-                    return execute_reply_error(exc_type, exc_value, [])
+                # Reject columns that have a different type. (allow none value)
+                if col_type != "NULL_TYPE" and header['type'] != col_type:
+                    if header['type'] == "NULL_TYPE":
+                        header['type'] = col_type
+                    else:
+                        exc_type = Exception
+                        exc_value = 'table rows have different types'
+                        return execute_reply_error(exc_type, exc_value, None)
 
             cols.append(col)
 
-    headers = [v for k, v in sorted(headers.iteritems())]
+    headers = [v for k, v in sorted(headers.items())]
 
     return {
         'application/vnd.livy.table.v1+json': {
@@ -335,7 +457,7 @@ def magic_json(name):
         value = global_dict[name]
     except KeyError:
         exc_type, exc_value, tb = sys.exc_info()
-        return execute_reply_error(exc_type, exc_value, [])
+        return execute_reply_error(exc_type, exc_value, None)
 
     return {
         'application/json': value,
@@ -344,15 +466,17 @@ def magic_json(name):
 def magic_matplot(name):
     try:
         value = global_dict[name]
-
         fig = value.gcf()
-        imgdata = StringIO.StringIO()
+        imgdata = io.BytesIO()
         fig.savefig(imgdata, format='png')
         imgdata.seek(0)
-        encode = base64.b64encode(imgdata.buf)
+        encode = base64.b64encode(imgdata.getvalue())
+        if sys.version >= '3':
+            encode = encode.decode()
+
     except:
         exc_type, exc_value, tb = sys.exc_info()
-        return execute_reply_error(exc_type, exc_value, [])
+        return execute_reply_error(exc_type, exc_value, None)
 
     return {
         'image/png': encode,
@@ -374,9 +498,18 @@ msg_type_router = {
     'shutdown_request': shutdown_request,
 }
 
-fake_stdin = cStringIO.StringIO()
-fake_stdout = cStringIO.StringIO()
-fake_stderr = cStringIO.StringIO()
+class UnicodeDecodingStringIO(io.StringIO):
+    def write(self, s):
+        if isinstance(s, bytes):
+            s = s.decode("utf-8")
+        super(UnicodeDecodingStringIO, self).write(s)
+
+
+def clearOutputs():
+    sys.stdout.close()
+    sys.stderr.close()
+    sys.stdout = UnicodeDecodingStringIO()
+    sys.stderr = UnicodeDecodingStringIO()
 
 
 def main():
@@ -384,22 +517,63 @@ def main():
     sys_stdout = sys.stdout
     sys_stderr = sys.stderr
 
-    sys.stdin = fake_stdin
-    sys.stdout = fake_stdout
-    sys.stderr = fake_stderr
+    if sys.version >= '3':
+        sys.stdin = io.StringIO()
+    else:
+        sys.stdin = cStringIO.StringIO()
 
+    sys.stdout = UnicodeDecodingStringIO()
+    sys.stderr = UnicodeDecodingStringIO()
+
+    spark_major_version = os.getenv("LIVY_SPARK_MAJOR_VERSION")
     try:
+        listening_port = 0
         if os.environ.get("LIVY_TEST") != "true":
-            # Load spark into the context
-            exec 'from pyspark.shell import sc' in global_dict
+            #Load spark into the context
+            exec('from pyspark.shell import sc', global_dict)
+            exec('from pyspark.shell import sqlContext', global_dict)
+            exec('from pyspark.sql import HiveContext', global_dict)
+            exec('from pyspark.streaming import StreamingContext', global_dict)
+            exec('import pyspark.cloudpickle as cloudpickle', global_dict)
 
-        print >> sys_stderr, fake_stdout.getvalue()
-        print >> sys_stderr, fake_stderr.getvalue()
+            if spark_major_version >= "2":
+                exec('from pyspark.shell import spark', global_dict)
+            else:
+                # LIVY-294, need to check whether HiveContext can work properly,
+                # fallback to SQLContext if HiveContext can not be initialized successfully.
+                # Only for spark-1.
+                code = textwrap.dedent("""
+                    import py4j
+                    from pyspark.sql import SQLContext
+                    try:
+                      sqlContext.tables()
+                    except py4j.protocol.Py4JError:
+                      sqlContext = SQLContext(sc)""")
+                exec(code, global_dict)
 
-        fake_stdout.truncate(0)
-        fake_stderr.truncate(0)
+            #Start py4j callback server
+            from py4j.protocol import ENTRY_POINT_OBJECT_ID
+            from py4j.java_gateway import JavaGateway, GatewayClient, CallbackServerParameters
 
-        print >> sys_stdout, 'READY'
+            gateway_client_port = int(os.environ.get("PYSPARK_GATEWAY_PORT"))
+            gateway = JavaGateway(GatewayClient(port=gateway_client_port))
+            gateway.start_callback_server(
+                callback_server_parameters=CallbackServerParameters(port=0))
+            socket_info = gateway._callback_server.server_socket.getsockname()
+            listening_port = socket_info[1]
+            pyspark_job_processor = PySparkJobProcessorImpl()
+            gateway.gateway_property.pool.dict[ENTRY_POINT_OBJECT_ID] = pyspark_job_processor
+
+            global local_tmp_dir_path, job_context
+            local_tmp_dir_path = tempfile.mkdtemp()
+            job_context = JobContextImpl()
+
+        print(sys.stdout.getvalue(), file=sys_stderr)
+        print(sys.stderr.getvalue(), file=sys_stderr)
+
+        clearOutputs()
+
+        print('READY(port=' + str(listening_port) + ')', file=sys_stdout)
         sys_stdout.flush()
 
         while True:
@@ -453,16 +627,17 @@ def main():
                     }
                 })
 
-            print >> sys_stdout, response
+            print(response, file=sys_stdout)
             sys_stdout.flush()
     finally:
         if os.environ.get("LIVY_TEST") != "true" and 'sc' in global_dict:
+            gateway.shutdown_callback_server()
+            shutil.rmtree(local_tmp_dir_path)
             global_dict['sc'].stop()
 
         sys.stdin = sys_stdin
         sys.stdout = sys_stdout
         sys.stderr = sys_stderr
-
 
 if __name__ == '__main__':
     sys.exit(main())

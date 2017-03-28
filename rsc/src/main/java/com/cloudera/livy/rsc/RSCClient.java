@@ -26,7 +26,6 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import io.netty.channel.ChannelHandlerContext;
@@ -39,11 +38,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.cloudera.livy.Job;
-import com.cloudera.livy.JobContext;
 import com.cloudera.livy.JobHandle;
 import com.cloudera.livy.LivyClient;
 import com.cloudera.livy.client.common.BufferUtils;
-import com.cloudera.livy.rsc.Utils;
+import com.cloudera.livy.rsc.driver.AddFileJob;
 import com.cloudera.livy.rsc.driver.AddJarJob;
 import com.cloudera.livy.rsc.rpc.Rpc;
 import static com.cloudera.livy.rsc.RSCConf.Entry.*;
@@ -53,17 +51,23 @@ public class RSCClient implements LivyClient {
   private static final AtomicInteger EXECUTOR_GROUP_ID = new AtomicInteger();
 
   private final RSCConf conf;
+  private final Promise<ContextInfo> contextInfoPromise;
   private final Map<String, JobHandleImpl<?>> jobs;
   private final ClientProtocol protocol;
   private final Promise<Rpc> driverRpc;
   private final int executorGroupId;
   private final EventLoopGroup eventLoopGroup;
+  private final Promise<URI> serverUriPromise;
 
   private ContextInfo contextInfo;
+  private Process driverProcess;
   private volatile boolean isAlive;
+  private volatile String replState;
 
-  RSCClient(RSCConf conf, Promise<ContextInfo> ctx) throws IOException {
+  RSCClient(RSCConf conf, Promise<ContextInfo> ctx, Process driverProcess) throws IOException {
     this.conf = conf;
+    this.contextInfoPromise = ctx;
+    this.driverProcess = driverProcess;
     this.jobs = new ConcurrentHashMap<>();
     this.protocol = new ClientProtocol();
     this.driverRpc = ImmediateEventExecutor.INSTANCE.newPromise();
@@ -71,20 +75,33 @@ public class RSCClient implements LivyClient {
     this.eventLoopGroup = new NioEventLoopGroup(
         conf.getInt(RPC_MAX_THREADS),
         Utils.newDaemonThreadFactory("RSCClient-" + executorGroupId + "-%d"));
+    this.serverUriPromise = ImmediateEventExecutor.INSTANCE.newPromise();
 
-    Utils.addListener(ctx, new FutureListener<ContextInfo>() {
+    Utils.addListener(this.contextInfoPromise, new FutureListener<ContextInfo>() {
       @Override
       public void onSuccess(ContextInfo info) throws Exception {
         connectToContext(info);
+        String url = String.format("rsc://%s:%s@%s:%d",
+          info.clientId, info.secret, info.remoteAddress, info.remotePort);
+        serverUriPromise.setSuccess(URI.create(url));
       }
 
       @Override
       public void onFailure(Throwable error) {
         connectionError(error);
+        serverUriPromise.setFailure(error);
       }
     });
 
     isAlive = true;
+  }
+
+  public boolean isAlive() {
+    return isAlive;
+  }
+
+  public Process getDriverProcess() {
+    return driverProcess;
   }
 
   private synchronized void connectToContext(final ContextInfo info) throws Exception {
@@ -107,7 +124,9 @@ public class RSCClient implements LivyClient {
             public void onSuccess(Void unused) {
               if (isAlive) {
                 LOG.warn("Client RPC channel closed unexpectedly.");
-                stop(false);
+                try {
+                  stop(false);
+                } catch (Exception e) { /* stop() itself prints warning. */ }
               }
             }
           });
@@ -128,7 +147,9 @@ public class RSCClient implements LivyClient {
 
   private void connectionError(Throwable error) {
     LOG.error("Failed to connect to context.", error);
-    stop(false);
+    try {
+      stop(false);
+    } catch (Exception e) { /* stop() itself prints warning. */ }
   }
 
   private <T> io.netty.util.concurrent.Future<T> deferredCall(final Object msg,
@@ -170,6 +191,10 @@ public class RSCClient implements LivyClient {
     return promise;
   }
 
+  public Future<URI> getServerUri() {
+    return serverUriPromise;
+  }
+
   @Override
   public <T> JobHandle<T> submit(Job<T> job) {
     return protocol.submit(job);
@@ -185,6 +210,8 @@ public class RSCClient implements LivyClient {
     if (isAlive) {
       isAlive = false;
       try {
+        this.contextInfoPromise.cancel(true);
+
         if (shutdownContext && driverRpc.isSuccess()) {
           protocol.endSession();
 
@@ -192,16 +219,12 @@ public class RSCClient implements LivyClient {
           // since it closes the channel while handling it, we wait for the RPC's channel
           // to close instead.
           long stopTimeout = conf.getTimeAsMs(CLIENT_SHUTDOWN_TIMEOUT);
-          try {
-            driverRpc.get().getChannel().closeFuture().get(stopTimeout,
-              TimeUnit.MILLISECONDS);
-          } catch (Exception e) {
-            LOG.warn("Error waiting for context to shut down: {} ({}).",
-              e.getClass().getSimpleName(), e.getMessage());
-          }
+          driverRpc.get().getChannel().closeFuture().get(stopTimeout,
+            TimeUnit.MILLISECONDS);
         }
       } catch (Exception e) {
         LOG.warn("Exception while waiting for end session reply.", e);
+        Utils.propagate(e);
       } finally {
         if (driverRpc.isSuccess()) {
           try {
@@ -262,18 +285,27 @@ public class RSCClient implements LivyClient {
     return contextInfo;
   }
 
-  public String submitReplCode(String code) throws Exception {
-    String id = UUID.randomUUID().toString();
-    deferredCall(new BaseProtocol.ReplJobRequest(code, id), Void.class);
-    return id;
+  public Future<Integer> submitReplCode(String code) throws Exception {
+    return deferredCall(new BaseProtocol.ReplJobRequest(code), Integer.class);
   }
 
-  public Future<String> getReplJobResult(String id) throws Exception {
-    return deferredCall(new BaseProtocol.GetReplJobResult(id), String.class);
+  public void cancelReplCode(int statementId) throws Exception {
+    deferredCall(new BaseProtocol.CancelReplJobRequest(statementId), Void.class);
   }
 
-  public Future<String> getReplState() {
-    return deferredCall(new BaseProtocol.GetReplState(), String.class);
+  public Future<ReplJobResults> getReplJobResults(Integer from, Integer size) throws Exception {
+    return deferredCall(new BaseProtocol.GetReplJobResults(from, size), ReplJobResults.class);
+  }
+
+  public Future<ReplJobResults> getReplJobResults() throws Exception {
+    return deferredCall(new BaseProtocol.GetReplJobResults(), ReplJobResults.class);
+  }
+
+  /**
+   * @return Return the repl state. If this's not connected to a repl session, it will return null.
+   */
+  public String getReplState() {
+    return replState;
   }
 
   private class ClientProtocol extends BaseProtocol {
@@ -369,26 +401,9 @@ public class RSCClient implements LivyClient {
       }
     }
 
+    private void handle(ChannelHandlerContext ctx, ReplState msg) {
+      LOG.trace("Received repl state for {}", msg.state);
+      replState = msg.state;
+    }
   }
-
-  private static class AddFileJob implements Job<Object> {
-
-    private final String path;
-
-    AddFileJob() {
-      this(null);
-    }
-
-    AddFileJob(String path) {
-      this.path = path;
-    }
-
-    @Override
-    public Object call(JobContext jc) throws Exception {
-      jc.sc().addFile(path);
-      return null;
-    }
-
-  }
-
 }

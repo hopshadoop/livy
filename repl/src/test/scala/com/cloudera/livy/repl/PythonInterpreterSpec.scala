@@ -19,15 +19,14 @@
 package com.cloudera.livy.repl
 
 import org.apache.spark.SparkConf
-import org.json4s.{DefaultFormats, JValue}
+import org.json4s.{DefaultFormats, JNull, JValue}
 import org.json4s.JsonDSL._
-import org.scalatest.Outcome
+import org.scalatest._
 
-class PythonInterpreterSpec extends BaseInterpreterSpec {
+import com.cloudera.livy.rsc.RSCConf
+import com.cloudera.livy.sessions._
 
-  implicit val formats = DefaultFormats
-
-  override def createInterpreter(): Interpreter = PythonInterpreter(new SparkConf())
+abstract class PythonBaseInterpreterSpec extends BaseInterpreterSpec {
 
   it should "execute `1 + 2` == 3" in withInterpreter { interpreter =>
     val response = interpreter.execute("1 + 2")
@@ -124,6 +123,46 @@ class PythonInterpreterSpec extends BaseInterpreterSpec {
     ))
   }
 
+  it should "do table magic with None type value" in withInterpreter { interpreter =>
+    val response = interpreter.execute(
+      """x = [{"a":"1", "b":None}, {"a":"2", "b":2}]
+        |%table x
+      """.stripMargin)
+
+    response should equal(Interpreter.ExecuteSuccess(
+      APPLICATION_LIVY_TABLE_JSON -> (
+        ("headers" -> List(
+          ("type" -> "STRING_TYPE") ~ ("name" -> "a"),
+          ("type" -> "INT_TYPE") ~ ("name" -> "b")
+        )) ~
+          ("data" -> List(
+            List[JValue]("1", JNull),
+            List[JValue]("2", 2)
+          ))
+        )
+    ))
+  }
+
+  it should "do table magic with None type Row" in withInterpreter { interpreter =>
+    val response = interpreter.execute(
+      """x = [{"a":None, "b":None}, {"a":"2", "b":2}]
+        |%table x
+      """.stripMargin)
+
+    response should equal(Interpreter.ExecuteSuccess(
+      APPLICATION_LIVY_TABLE_JSON -> (
+        ("headers" -> List(
+          ("type" -> "STRING_TYPE") ~ ("name" -> "a"),
+          ("type" -> "INT_TYPE") ~ ("name" -> "b")
+        )) ~
+          ("data" -> List(
+            List[JValue](JNull, JNull),
+            List[JValue]("2", 2)
+          ))
+        )
+    ))
+  }
+
   it should "allow magic inside statements" in withInterpreter { interpreter =>
     val response = interpreter.execute(
       """x = [[1, 'a'], [3, 'b']]
@@ -137,7 +176,7 @@ class PythonInterpreterSpec extends BaseInterpreterSpec {
   }
 
   it should "capture stdout" in withInterpreter { interpreter =>
-    val response = interpreter.execute("print 'Hello World'")
+    val response = interpreter.execute("print('Hello World')")
     response should equal(Interpreter.ExecuteSuccess(
       TEXT_PLAIN -> "Hello World"
     ))
@@ -200,5 +239,49 @@ class PythonInterpreterSpec extends BaseInterpreterSpec {
       )
     ))
   }
+}
 
+class Python2InterpreterSpec extends PythonBaseInterpreterSpec {
+
+  implicit val formats = DefaultFormats
+
+  override def createInterpreter(): Interpreter =
+    PythonInterpreter(new SparkConf(), PySpark(), new StatementProgressListener(new RSCConf()))
+
+  // Scalastyle is treating unicode escape as non ascii characters. Turn off the check.
+  // scalastyle:off non.ascii.character.disallowed
+  it should "print unicode correctly" in withInterpreter { intp =>
+    intp.execute("print(u\"\u263A\")") should equal(Interpreter.ExecuteSuccess(
+      TEXT_PLAIN -> "\u263A"
+    ))
+    intp.execute("""print(u"\u263A")""") should equal(Interpreter.ExecuteSuccess(
+      TEXT_PLAIN -> "\u263A"
+    ))
+    intp.execute("""print("\xE2\x98\xBA")""") should equal(Interpreter.ExecuteSuccess(
+      TEXT_PLAIN -> "\u263A"
+    ))
+  }
+  // scalastyle:on non.ascii.character.disallowed
+}
+
+class Python3InterpreterSpec extends PythonBaseInterpreterSpec {
+
+  implicit val formats = DefaultFormats
+
+  override protected def withFixture(test: NoArgTest): Outcome = {
+    assume(!sys.props.getOrElse("skipPySpark3Tests", "false").toBoolean, "Skipping PySpark3 tests.")
+    test()
+  }
+
+  override def createInterpreter(): Interpreter =
+    PythonInterpreter(new SparkConf(), PySpark3(), new StatementProgressListener(new RSCConf()))
+
+  it should "check python version is 3.x" in withInterpreter { interpreter =>
+    val response = interpreter.execute("""import sys
+      |sys.version >= '3'
+      """.stripMargin)
+    response should equal (Interpreter.ExecuteSuccess(
+      TEXT_PLAIN -> "True"
+    ))
+  }
 }

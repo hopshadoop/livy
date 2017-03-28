@@ -22,11 +22,14 @@ import org.apache.spark.SparkConf
 import org.json4s.{DefaultFormats, JValue}
 import org.json4s.JsonDSL._
 
+import com.cloudera.livy.rsc.RSCConf
+
 class ScalaInterpreterSpec extends BaseInterpreterSpec {
 
   implicit val formats = DefaultFormats
 
-  override def createInterpreter(): Interpreter = new SparkInterpreter(new SparkConf())
+  override def createInterpreter(): Interpreter =
+    new SparkInterpreter(new SparkConf(), new StatementProgressListener(new RSCConf()))
 
   it should "execute `1 + 2` == 3" in withInterpreter { interpreter =>
     val response = interpreter.execute("1 + 2")
@@ -123,5 +126,82 @@ class ScalaInterpreterSpec extends BaseInterpreterSpec {
     response should equal(Interpreter.ExecuteSuccess(
       TEXT_PLAIN -> "res0: Array[Int] = Array(1, 2)"
     ))
+  }
+
+  it should "handle statements ending with comments" in withInterpreter { interpreter =>
+    // Test statements with only comments
+    var response = interpreter.execute("""// comment""")
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> ""))
+
+    response = interpreter.execute(
+      """/*
+        |comment
+        |*/
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> ""))
+
+    // Test statements ending with comments
+    response = interpreter.execute(
+      """val r = 1
+        |// comment
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> "r: Int = 1"))
+
+    response = interpreter.execute(
+      """val r = 1
+        |/*
+        |comment
+        |comment
+        |*/
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> "r: Int = 1"))
+
+    // Test statements ending with a mix of single line and multi-line comments
+    response = interpreter.execute(
+      """val r = 1
+        |// comment
+        |/*
+        |comment
+        |comment
+        |*/
+        |// comment
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> "r: Int = 1"))
+
+    response = interpreter.execute(
+      """val r = 1
+        |/*
+        |comment
+        |// comment
+        |comment
+        |*/
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteSuccess(TEXT_PLAIN -> "r: Int = 1"))
+
+    // Make sure incomplete statement is still returned as incomplete statement.
+    response = interpreter.execute("sc.")
+    response should equal(Interpreter.ExecuteIncomplete())
+
+    // Make sure incomplete statement is still returned as incomplete statement.
+    response = interpreter.execute(
+      """sc.
+        |// comment
+      """.stripMargin)
+    response should equal(Interpreter.ExecuteIncomplete())
+
+    // Make sure our handling doesn't mess up a string with value like comments.
+    val tripleQuotes = "\"\"\""
+    val stringWithComment = s"/*\ncomment\n*/\n//comment"
+    response = interpreter.execute(s"val r = $tripleQuotes$stringWithComment$tripleQuotes")
+
+    try {
+      response should equal(
+        Interpreter.ExecuteSuccess(TEXT_PLAIN -> s"r: String = \n$stringWithComment"))
+    } catch {
+      case _: Exception =>
+        response should equal(
+          // Scala 2.11 doesn't have a " " after "="
+          Interpreter.ExecuteSuccess(TEXT_PLAIN -> s"r: String =\n$stringWithComment"))
+    }
   }
 }

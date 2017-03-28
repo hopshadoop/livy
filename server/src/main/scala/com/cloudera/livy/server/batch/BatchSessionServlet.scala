@@ -22,20 +22,34 @@ import javax.servlet.http.HttpServletRequest
 
 import com.cloudera.livy.LivyConf
 import com.cloudera.livy.server.SessionServlet
+import com.cloudera.livy.server.recovery.SessionStore
+import com.cloudera.livy.sessions.BatchSessionManager
+import com.cloudera.livy.utils.AppInfo
 
-case class BatchSessionView(id: Long, state: String, log: Seq[String])
+case class BatchSessionView(
+  id: Long,
+  state: String,
+  appId: Option[String],
+  appInfo: AppInfo,
+  log: Seq[String])
 
-class BatchSessionServlet(livyConf: LivyConf)
-  extends SessionServlet[BatchSession](livyConf)
+class BatchSessionServlet(
+    sessionManager: BatchSessionManager,
+    sessionStore: SessionStore,
+    livyConf: LivyConf)
+  extends SessionServlet(sessionManager, livyConf)
 {
 
   override protected def createSession(req: HttpServletRequest): BatchSession = {
     val createRequest = bodyAs[CreateBatchRequest](req)
     val proxyUser = checkImpersonation(createRequest.proxyUser, req)
-    new BatchSession(sessionManager.nextId(), remoteUser(req), proxyUser, livyConf, createRequest)
+    BatchSession.create(
+      sessionManager.nextId(), createRequest, livyConf, remoteUser(req), proxyUser, sessionStore)
   }
 
-  override protected def clientSessionView(session: BatchSession, req: HttpServletRequest): Any = {
+  override protected[batch] def clientSessionView(
+      session: BatchSession,
+      req: HttpServletRequest): Any = {
     val logs =
       if (hasAccess(session.owner, req)) {
         val lines = session.logLines()
@@ -48,7 +62,7 @@ class BatchSessionServlet(livyConf: LivyConf)
       } else {
         Nil
       }
-    BatchSessionView(session.id, session.state.toString, logs)
+    BatchSessionView(session.id, session.state.toString, session.appId, session.appInfo, logs)
   }
 
 }

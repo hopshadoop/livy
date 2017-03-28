@@ -31,27 +31,126 @@ import org.apache.hadoop.fs.permission.FsPermission
 import org.apache.hadoop.security.UserGroupInformation
 
 import com.cloudera.livy.{LivyConf, Logging, Utils}
+import com.cloudera.livy.utils.AppInfo
 
 object Session {
+  trait RecoveryMetadata { val id: Int }
 
   lazy val configBlackList: Set[String] = {
     val url = getClass.getResource("/spark-blacklist.conf")
     if (url != null) Utils.loadProperties(url).keySet else Set()
   }
 
+  /**
+   * Validates and prepares a user-provided configuration for submission.
+   *
+   * - Verifies that no blacklisted configurations are provided.
+   * - Merges file lists in the configuration with the explicit lists provided in the request
+   * - Resolve file URIs to make sure they reference the default FS
+   * - Verify that file URIs don't reference non-whitelisted local resources
+   */
+  def prepareConf(
+      conf: Map[String, String],
+      jars: Seq[String],
+      files: Seq[String],
+      archives: Seq[String],
+      pyFiles: Seq[String],
+      livyConf: LivyConf): Map[String, String] = {
+    if (conf == null) {
+      return Map()
+    }
+
+    val errors = conf.keySet.filter(configBlackList.contains)
+    if (errors.nonEmpty) {
+      throw new IllegalArgumentException(
+        "Blacklisted configuration values in session config: " + errors.mkString(", "))
+    }
+
+    val confLists: Map[String, Seq[String]] = livyConf.sparkFileLists
+      .map { key => (key -> Nil) }.toMap
+
+    val userLists = confLists ++ Map(
+      LivyConf.SPARK_JARS -> jars,
+      LivyConf.SPARK_FILES -> files,
+      LivyConf.SPARK_ARCHIVES -> archives,
+      LivyConf.SPARK_PY_FILES -> pyFiles)
+
+    val merged = userLists.flatMap { case (key, list) =>
+      val confList = conf.get(key)
+        .map { list =>
+          resolveURIs(list.split("[, ]+").toSeq, livyConf)
+        }
+        .getOrElse(Nil)
+      val userList = resolveURIs(list, livyConf)
+      if (confList.nonEmpty || userList.nonEmpty) {
+        Some(key -> (userList ++ confList).mkString(","))
+      } else {
+        None
+      }
+    }
+
+    val masterConfList = Map(LivyConf.SPARK_MASTER -> livyConf.sparkMaster()) ++
+      livyConf.sparkDeployMode().map(LivyConf.SPARK_DEPLOY_MODE -> _).toMap
+
+    conf ++ masterConfList ++ merged
+  }
+
+  /**
+   * Prepends the value of the "fs.defaultFS" configuration to any URIs that do not have a
+   * scheme. URIs are required to at least be absolute paths.
+   *
+   * @throws IllegalArgumentException If an invalid URI is found in the given list.
+   */
+  def resolveURIs(uris: Seq[String], livyConf: LivyConf): Seq[String] = {
+    val defaultFS = livyConf.hadoopConf.get("fs.defaultFS").stripSuffix("/")
+    uris.filter(_.nonEmpty).map { _uri =>
+      val uri = try {
+        new URI(_uri)
+      } catch {
+        case e: URISyntaxException => throw new IllegalArgumentException(e)
+      }
+      resolveURI(uri, livyConf).toString()
+    }
+  }
+
+  def resolveURI(uri: URI, livyConf: LivyConf): URI = {
+    val defaultFS = livyConf.hadoopConf.get("fs.defaultFS").stripSuffix("/")
+    val resolved =
+      if (uri.getScheme() == null) {
+        require(uri.getPath().startsWith("/"), s"Path '${uri.getPath()}' is not absolute.")
+        new URI(defaultFS + uri.getPath())
+      } else {
+        uri
+      }
+
+    if (resolved.getScheme() == "file") {
+      // Make sure the location is whitelisted before allowing local files to be added.
+      require(livyConf.localFsWhitelist.find(resolved.getPath().startsWith).isDefined,
+        s"Local path ${uri.getPath()} cannot be added to user sessions.")
+    }
+
+    resolved
+  }
 }
 
-abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf) extends Logging {
+abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf)
+  extends Logging {
 
   import Session._
 
   protected implicit val executionContext = ExecutionContext.global
+
+  protected var _appId: Option[String] = None
 
   private var _lastActivity = System.nanoTime()
 
   // Directory where the session's staging files are created. The directory is only accessible
   // to the session's effective user.
   private var stagingDir: Path = null
+
+  def appId: Option[String] = _appId
+
+  var appInfo: AppInfo = AppInfo()
 
   def lastActivity: Long = state match {
     case SessionState.Error(time) => time
@@ -60,13 +159,21 @@ abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf) e
     case _ => _lastActivity
   }
 
-  val timeout: Long = TimeUnit.HOURS.toNanos(1)
+  def logLines(): IndexedSeq[String]
+
+  def recordActivity(): Unit = {
+    _lastActivity = System.nanoTime()
+  }
+
+  def recoveryMetadata: RecoveryMetadata
 
   def state: SessionState
 
   def stop(): Future[Unit] = Future {
     try {
+      info(s"Stopping $this...")
       stopSession()
+      info(s"Stopped $this.")
     } catch {
       case e: Exception =>
         warn(s"Error stopping session $id.", e)
@@ -90,11 +197,8 @@ abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf) e
     }
   }
 
-  def recordActivity(): Unit = {
-    _lastActivity = System.nanoTime()
-  }
 
-  def logLines(): IndexedSeq[String]
+  override def toString(): String = s"${this.getClass.getSimpleName} $id"
 
   protected def stopSession(): Unit
 
@@ -104,7 +208,11 @@ abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf) e
     val user = proxyUser.getOrElse(owner)
     if (user != null) {
       val ugi = if (UserGroupInformation.isSecurityEnabled) {
-        UserGroupInformation.createProxyUser(user, UserGroupInformation.getCurrentUser())
+        if (livyConf.getBoolean(LivyConf.IMPERSONATION_ENABLED)) {
+          UserGroupInformation.createProxyUser(user, UserGroupInformation.getCurrentUser())
+        } else {
+          UserGroupInformation.getCurrentUser()
+        }
       } else {
         UserGroupInformation.createRemoteUser(user)
       }
@@ -137,92 +245,6 @@ abstract class Session(val id: Int, val owner: String, val livyConf: LivyConf) e
     } finally {
       fs.close()
     }
-  }
-
-  /**
-   * Prepends the value of the "fs.defaultFS" configuration to any URIs that do not have a
-   * scheme. URIs are required to at least be absolute paths.
-   *
-   * @throws IllegalArgumentException If an invalid URI is found in the given list.
-   */
-  protected def resolveURIs(uris: Seq[String]): Seq[String] = {
-    val defaultFS = livyConf.hadoopConf.get("fs.defaultFS").stripSuffix("/")
-    uris.filter(_.nonEmpty).map { _uri =>
-      val uri = try {
-        new URI(_uri)
-      } catch {
-        case e: URISyntaxException => throw new IllegalArgumentException(e)
-      }
-      resolveURI(uri).toString()
-    }
-  }
-
-  protected def resolveURI(uri: URI): URI = {
-    val defaultFS = livyConf.hadoopConf.get("fs.defaultFS").stripSuffix("/")
-    val resolved =
-      if (uri.getScheme() == null) {
-        require(uri.getPath().startsWith("/"), s"Path '${uri.getPath()}' is not absolute.")
-        new URI(defaultFS + uri.getPath())
-      } else {
-        uri
-      }
-
-    if (resolved.getScheme() == "file") {
-      // Make sure the location is whitelisted before allowing local files to be added.
-      require(livyConf.localFsWhitelist.find(resolved.getPath().startsWith).isDefined,
-        s"Local path ${uri.getPath()} cannot be added to user sessions.")
-    }
-
-    resolved
-  }
-
-  /**
-   * Validates and prepares a user-provided configuration for submission.
-   *
-   * - Verifies that no blacklisted configurations are provided.
-   * - Merges file lists in the configuration with the explicit lists provided in the request
-   * - Resolve file URIs to make sure they reference the default FS
-   * - Verify that file URIs don't reference non-whitelisted local resources
-   */
-  protected def prepareConf(conf: Map[String, String],
-      jars: Seq[String],
-      files: Seq[String],
-      archives: Seq[String],
-      pyFiles: Seq[String]): Map[String, String] = {
-    if (conf == null) {
-      return Map()
-    }
-
-    val errors = conf.keySet.filter(configBlackList.contains)
-    if (errors.nonEmpty) {
-      throw new IllegalArgumentException(
-        "Blacklisted configuration values in session config: " + errors.mkString(", "))
-    }
-
-    val confLists: Map[String, Seq[String]] = livyConf.sparkFileLists
-      .map { key => (key -> Nil) }.toMap
-
-    val userLists = confLists ++ Map(
-      LivyConf.SPARK_JARS -> jars,
-      LivyConf.SPARK_FILES -> files,
-      LivyConf.SPARK_ARCHIVES -> archives,
-      LivyConf.SPARK_PY_FILES -> pyFiles)
-
-    val merged = userLists.flatMap { case (key, list) =>
-      val confList = conf.get(key)
-        .map { list =>
-          resolveURIs(list.split("[, ]+").toSeq)
-        }
-        .getOrElse(Nil)
-      val userList = resolveURIs(list)
-      if (confList.nonEmpty || userList.nonEmpty) {
-        Some(key -> (userList ++ confList).mkString(","))
-      } else {
-        None
-      }
-    }
-
-    conf ++ merged
   }
 
   private def getStagingDir(fs: FileSystem): Path = synchronized {

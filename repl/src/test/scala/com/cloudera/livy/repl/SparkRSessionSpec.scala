@@ -18,28 +18,27 @@
 
 package com.cloudera.livy.repl
 
-import scala.concurrent.Await
-import scala.concurrent.duration.Duration
-
 import org.apache.spark.SparkConf
 import org.json4s.Extraction
-import org.json4s.JsonAST.JValue
-import org.scalatest._
+import org.json4s.jackson.JsonMethods.parse
+
+import com.cloudera.livy.rsc.RSCConf
 
 class SparkRSessionSpec extends BaseSessionSpec {
 
   override protected def withFixture(test: NoArgTest) = {
     assume(!sys.props.getOrElse("skipRTests", "false").toBoolean, "Skipping R tests.")
-    test()
+    super.withFixture(test)
   }
 
-  override def createInterpreter(): Interpreter = SparkRInterpreter(new SparkConf())
+  override def createInterpreter(): Interpreter =
+    SparkRInterpreter(new SparkConf(), new StatementProgressListener(new RSCConf()))
 
   it should "execute `1 + 2` == 3" in withSession { session =>
-    val statement = session.execute("1 + 2")
+    val statement = execute(session)("1 + 2")
     statement.id should equal(0)
 
-    val result = statement.result
+    val result = parse(statement.output)
     val expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 0,
@@ -52,10 +51,11 @@ class SparkRSessionSpec extends BaseSessionSpec {
   }
 
   it should "execute `x = 1`, then `y = 2`, then `x + y`" in withSession { session =>
-    var statement = session.execute("x = 1")
+    val executeWithSession = execute(session)(_)
+    var statement = executeWithSession("x = 1")
     statement.id should equal (0)
 
-    var result = statement.result
+    var result = parse(statement.output)
     var expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 0,
@@ -66,10 +66,10 @@ class SparkRSessionSpec extends BaseSessionSpec {
 
     result should equal (expectedResult)
 
-    statement = session.execute("y = 2")
+    statement = executeWithSession("y = 2")
     statement.id should equal (1)
 
-    result = statement.result
+    result = parse(statement.output)
     expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 1,
@@ -80,10 +80,10 @@ class SparkRSessionSpec extends BaseSessionSpec {
 
     result should equal (expectedResult)
 
-    statement = session.execute("x + y")
+    statement = executeWithSession("x + y")
     statement.id should equal (2)
 
-    result = statement.result
+    result = parse(statement.output)
     expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 2,
@@ -96,10 +96,10 @@ class SparkRSessionSpec extends BaseSessionSpec {
   }
 
   it should "capture stdout from print" in withSession { session =>
-    val statement = session.execute("""print('Hello World')""")
+    val statement = execute(session)("""print('Hello World')""")
     statement.id should equal (0)
 
-    val result = statement.result
+    val result = parse(statement.output)
     val expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 0,
@@ -112,10 +112,10 @@ class SparkRSessionSpec extends BaseSessionSpec {
   }
 
   it should "capture stdout from cat" in withSession { session =>
-    val statement = session.execute("""cat(3)""")
+    val statement = execute(session)("""cat(3)""")
     statement.id should equal (0)
 
-    val result = statement.result
+    val result = parse(statement.output)
     val expectedResult = Extraction.decompose(Map(
       "status" -> "ok",
       "execution_count" -> 0,
@@ -128,16 +128,16 @@ class SparkRSessionSpec extends BaseSessionSpec {
   }
 
   it should "report an error if accessing an unknown variable" in withSession { session =>
-    val statement = session.execute("""x""")
+    val statement = execute(session)("""x""")
     statement.id should equal (0)
 
-    val result = statement.result
+    val result = parse(statement.output)
     val expectedResult = Extraction.decompose(Map(
-      "status" -> "ok",
+      "status" -> "error",
       "execution_count" -> 0,
-      "data" -> Map(
-        "text/plain" -> "Error: object 'x' not found"
-      )
+      "ename" -> "Error",
+      "evalue" -> "[1] \"Error in eval(expr, envir, enclos): object 'x' not found\"",
+      "traceback" -> List()
     ))
 
     result should equal (expectedResult)

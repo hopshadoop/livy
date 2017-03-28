@@ -19,10 +19,15 @@
 package com.cloudera.livy.test.framework
 
 import java.io._
+import java.nio.charset.Charset
+import java.nio.file.{Files, Paths}
+import javax.servlet.http.HttpServletResponse
 
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
+import com.ning.http.client.AsyncHttpClient
+import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.hdfs.MiniDFSCluster
@@ -31,7 +36,8 @@ import org.apache.hadoop.yarn.server.MiniYARNCluster
 import org.apache.spark.launcher.SparkLauncher
 import org.scalatest.concurrent.Eventually._
 
-import com.cloudera.livy.Logging
+import com.cloudera.livy.{LivyConf, Logging}
+import com.cloudera.livy.client.common.TestUtils
 import com.cloudera.livy.server.LivyServer
 
 private class MiniClusterConfig(val config: Map[String, String]) {
@@ -48,6 +54,13 @@ private class MiniClusterConfig(val config: Map[String, String]) {
 }
 
 sealed trait MiniClusterUtils extends ClusterUtils {
+  private val livySparkScalaVersionEnvVarName = "LIVY_SPARK_SCALA_VERSION"
+
+  protected def getSparkScalaVersion(): String = {
+    sys.env.getOrElse(livySparkScalaVersionEnvVarName, {
+      throw new RuntimeException(s"Please specify env var $livySparkScalaVersionEnvVarName.")
+    })
+  }
 
   protected def saveConfig(conf: Configuration, dest: File): Unit = {
     val redacted = new Configuration(conf)
@@ -137,18 +150,36 @@ object MiniYarnMain extends MiniClusterBase {
 }
 
 object MiniLivyMain extends MiniClusterBase {
+  var livyUrl: Option[String] = None
 
   def start(config: MiniClusterConfig, configPath: String): Unit = {
+    var livyConf = Map(
+      LivyConf.LIVY_SPARK_MASTER.key -> "yarn",
+      LivyConf.LIVY_SPARK_DEPLOY_MODE.key -> "cluster",
+      LivyConf.LIVY_SPARK_SCALA_VERSION.key -> getSparkScalaVersion(),
+      LivyConf.HEARTBEAT_WATCHDOG_INTERVAL.key -> "1s",
+      LivyConf.YARN_POLL_INTERVAL.key -> "500ms",
+      LivyConf.RECOVERY_MODE.key -> "recovery",
+      LivyConf.RECOVERY_STATE_STORE.key -> "filesystem",
+      LivyConf.RECOVERY_STATE_STORE_URL.key -> s"file://$configPath/state-store")
+
+    if (Cluster.isRunningOnTravis) {
+      livyConf ++= Map("livy.server.yarn.app-lookup-timeout" -> "2m")
+    }
+
+    saveProperties(livyConf, new File(configPath + "/livy.conf"))
+
     val server = new LivyServer()
     server.start()
-
-    // Write a livy.conf file to the conf directory with the location of the Livy
+    server.livyConf.set(LivyConf.ENABLE_HIVE_CONTEXT, true)
+    // Write a serverUrl.conf file to the conf directory with the location of the Livy
     // server. Do it atomically since it's used by MiniCluster to detect when the Livy server
     // is up and ready.
-    val clientConf = Map("livy.server.serverUrl" -> server.serverUrl())
-    saveProperties(clientConf, new File(configPath + "/livy.conf"))
+    eventually(timeout(30 seconds), interval(1 second)) {
+      val serverUrlConf = Map("livy.server.serverUrl" -> server.serverUrl())
+      saveProperties(serverUrlConf, new File(configPath + "/serverUrl.conf"))
+    }
   }
-
 }
 
 private case class ProcessInfo(process: Process, logFile: File)
@@ -167,8 +198,7 @@ private case class ProcessInfo(process: Process, logFile: File)
  * TODO: add support for MiniKdc.
  */
 class MiniCluster(config: Map[String, String]) extends Cluster with MiniClusterUtils with Logging {
-
-  private val tempDir = new File(sys.props("java.io.tmpdir"))
+  private val tempDir = new File(s"${sys.props("java.io.tmpdir")}/livy-int-test")
   private var sparkConfDir: File = _
   private var _configDir: File = _
   private var hdfs: Option[ProcessInfo] = None
@@ -202,19 +232,35 @@ class MiniCluster(config: Map[String, String]) extends Cluster with MiniClusterU
   }
 
   override def deploy(): Unit = {
+    if (tempDir.exists()) {
+      FileUtils.deleteQuietly(tempDir)
+    }
+    assert(tempDir.mkdir(), "Cannot create temp test dir.")
     sparkConfDir = mkdir("spark-conf")
 
     // When running a real Spark cluster, don't set the classpath.
     val extraCp = if (!isRealSpark()) {
+      val sparkScalaVersion = getSparkScalaVersion()
+      val classPathFile =
+        new File(s"minicluster-dependencies/scala-$sparkScalaVersion/target/classpath")
+      assert(classPathFile.isFile,
+        s"Cannot read MiniCluster classpath file: ${classPathFile.getCanonicalPath}")
+      val sparkClassPath =
+        FileUtils.readFileToString(classPathFile, Charset.defaultCharset())
+
+      val dummyJar = Files.createTempFile(Paths.get(tempDir.toURI), "dummy", "jar").toFile
       Map(
-        SparkLauncher.DRIVER_EXTRA_CLASSPATH -> childClasspath,
-        SparkLauncher.EXECUTOR_EXTRA_CLASSPATH -> childClasspath)
+        SparkLauncher.DRIVER_EXTRA_CLASSPATH -> sparkClassPath,
+        SparkLauncher.EXECUTOR_EXTRA_CLASSPATH -> sparkClassPath,
+        // Used for Spark 2.0. Spark 2.0 will upload specified jars to distributed cache in yarn
+        // mode, if not specified it will check jars folder. Here since jars folder is not
+        // existed, so it will throw exception.
+        "spark.yarn.jars" -> dummyJar.getAbsolutePath)
     } else {
       Map()
     }
 
     val sparkConf = extraCp ++ Map(
-      SparkLauncher.SPARK_MASTER -> "yarn-cluster",
       "spark.executor.instances" -> "1",
       "spark.scheduler.minRegisteredResourcesRatio" -> "0.0",
       "spark.ui.enabled" -> "false",
@@ -243,11 +289,23 @@ class MiniCluster(config: Map[String, String]) extends Cluster with MiniClusterU
 
   def runLivy(): Unit = {
     assert(!livy.isDefined)
-    val confFile = new File(configDir, "livy.conf")
-    val localLivy = start(MiniLivyMain.getClass, confFile)
+    val confFile = new File(configDir, "serverUrl.conf")
+    val jacocoArgs = Option(TestUtils.getJacocoArgs())
+      .map { args =>
+        Seq(args, s"-Djacoco.args=$args")
+      }.getOrElse(Nil)
+    val localLivy = start(MiniLivyMain.getClass, confFile, extraJavaArgs = jacocoArgs)
 
     val props = loadProperties(confFile)
     livyUrl = props("livy.server.serverUrl")
+
+    // Wait until Livy server responds.
+    val httpClient = new AsyncHttpClient()
+    eventually(timeout(30 seconds), interval(1 second)) {
+      val res = httpClient.prepareGet(livyUrl).execute().get()
+      assert(res.getStatusCode() == HttpServletResponse.SC_OK)
+    }
+
     livy = Some(localLivy)
   }
 
@@ -255,32 +313,42 @@ class MiniCluster(config: Map[String, String]) extends Cluster with MiniClusterU
     assert(livy.isDefined)
     livy.foreach(stop)
     livyUrl = null
+    livy = None
   }
 
   def livyEndpoint: String = livyUrl
 
   private def mkdir(name: String, parent: File = tempDir): File = {
     val dir = new File(parent, name)
-    if (!dir.isDirectory()) {
-      assert(dir.mkdir(), "Failed to create directory.")
+    if (!dir.exists()) {
+      assert(dir.mkdir(), s"Failed to create directory $name.")
     }
     dir
   }
 
-  private def start(klass: Class[_], configFile: File): ProcessInfo = {
+  private def start(
+      klass: Class[_],
+      configFile: File,
+      extraJavaArgs: Seq[String] = Nil): ProcessInfo = {
     val simpleName = klass.getSimpleName().stripSuffix("$")
     val procDir = mkdir(simpleName)
     val procTmp = mkdir("tmp", parent = procDir)
 
+    // Before starting anything, clean up previous running sessions.
+    sys.process.Process(s"pkill -f $simpleName") !
+
     val java = sys.props("java.home") + "/bin/java"
-    val cmd = Seq(
-      sys.props("java.home") + "/bin/java",
-      "-Dtest.appender=console",
-      "-Djava.io.tmpdir=" + procTmp.getAbsolutePath(),
-      "-cp", childClasspath + File.pathSeparator + configDir.getAbsolutePath(),
-      "-XX:MaxPermSize=256m",
-      klass.getName().stripSuffix("$"),
-      configDir.getAbsolutePath())
+    val cmd =
+      Seq(
+        sys.props("java.home") + "/bin/java",
+        "-Dtest.appender=console",
+        "-Djava.io.tmpdir=" + procTmp.getAbsolutePath(),
+        "-cp", childClasspath + File.pathSeparator + configDir.getAbsolutePath(),
+        "-XX:MaxPermSize=256m") ++
+      extraJavaArgs ++
+      Seq(
+        klass.getName().stripSuffix("$"),
+        configDir.getAbsolutePath())
 
     val logFile = new File(procDir, "output.log")
     val pb = new ProcessBuilder(cmd.toArray: _*)
@@ -288,6 +356,7 @@ class MiniCluster(config: Map[String, String]) extends Cluster with MiniClusterU
       .redirectErrorStream(true)
       .redirectOutput(ProcessBuilder.Redirect.appendTo(logFile))
 
+    pb.environment().put("LIVY_CONF_DIR", configDir.getAbsolutePath())
     pb.environment().put("HADOOP_CONF_DIR", configDir.getAbsolutePath())
     pb.environment().put("SPARK_CONF_DIR", sparkConfDir.getAbsolutePath())
     pb.environment().put("SPARK_LOCAL_IP", "127.0.0.1")

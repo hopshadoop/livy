@@ -69,7 +69,15 @@ public class RSCConf extends ClientConf<RSCConf> {
     RPC_SECRET_RANDOM_BITS("secret.bits", 256),
 
     SASL_MECHANISMS("rpc.sasl.mechanisms", "DIGEST-MD5"),
-    SASL_QOP("rpc.sasl.qop", null);
+    SASL_QOP("rpc.sasl.qop", null),
+
+    TEST_STUCK_END_SESSION("test.do_not_use.stuck_end_session", false),
+    TEST_STUCK_START_DRIVER("test.do_not_use.stuck_start_driver", false),
+
+    JOB_CANCEL_TRIGGER_INTERVAL("job_cancel.trigger_interval", "100ms"),
+    JOB_CANCEL_TIMEOUT("job_cancel.timeout", "30s"),
+
+    RETAINED_STATEMENT_NUMBER("retained_statements", 100);
 
     private final String key;
     private final Object dflt;
@@ -84,6 +92,10 @@ public class RSCConf extends ClientConf<RSCConf> {
 
     @Override
     public Object dflt() { return dflt; }
+  }
+
+  public RSCConf() {
+    this(new Properties());
   }
 
   public RSCConf(Properties config) {

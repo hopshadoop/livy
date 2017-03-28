@@ -18,6 +18,7 @@
 package com.cloudera.livy.rsc;
 
 import com.cloudera.livy.Job;
+import com.cloudera.livy.rsc.driver.Statement;
 import com.cloudera.livy.rsc.rpc.RpcDispatcher;
 
 public abstract class BaseProtocol extends RpcDispatcher {
@@ -58,7 +59,7 @@ public abstract class BaseProtocol extends RpcDispatcher {
 
   }
 
-  protected static class BypassJobRequest {
+  public static class BypassJobRequest {
 
     public final String id;
     public final byte[] serializedJob;
@@ -171,34 +172,56 @@ public abstract class BaseProtocol extends RpcDispatcher {
   public static class ReplJobRequest {
 
     public final String code;
-    public final String id;
 
-    public ReplJobRequest(String code, String id) {
+    public ReplJobRequest(String code) {
       this.code = code;
-      this.id = id;
     }
 
     public ReplJobRequest() {
-      this(null, null);
+      this(null);
     }
   }
 
-  public static class GetReplJobResult {
+  public static class GetReplJobResults {
+    public boolean allResults;
+    public Integer from, size;
 
-    public final String id;
+    public GetReplJobResults(Integer from, Integer size) {
+      this.allResults = false;
+      this.from = from;
+      this.size = size;
+    }
 
-    public GetReplJobResult(String id) {
+    public GetReplJobResults() {
+      this.allResults = true;
+      from = null;
+      size = null;
+    }
+  }
+
+  protected static class ReplState {
+
+    public final String state;
+
+    public ReplState(String state) {
+      this.state = state;
+    }
+
+    public ReplState() {
+      this(null);
+    }
+  }
+
+  public static class CancelReplJobRequest {
+    public final int id;
+
+    public CancelReplJobRequest(int id) {
       this.id = id;
     }
 
-    public GetReplJobResult() {
-      this(null);
+    public CancelReplJobRequest() {
+      this(-1);
     }
-
-  }
-
-  public static class GetReplState {
-
   }
 
   public static class InitializationError {

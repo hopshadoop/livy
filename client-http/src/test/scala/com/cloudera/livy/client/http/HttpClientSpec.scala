@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicLong
 import javax.servlet.ServletContext
 import javax.servlet.http.HttpServletRequest
 
-import scala.collection.JavaConverters._
 import scala.concurrent.{ExecutionContext, Future}
 
 import org.mockito.ArgumentCaptor
@@ -41,15 +40,17 @@ import com.cloudera.livy.client.common.{BufferUtils, Serializer}
 import com.cloudera.livy.client.common.HttpMessages._
 import com.cloudera.livy.server.WebServer
 import com.cloudera.livy.server.interactive.{InteractiveSession, InteractiveSessionServlet}
-import com.cloudera.livy.sessions.{SessionState, Spark}
+import com.cloudera.livy.server.recovery.SessionStore
+import com.cloudera.livy.sessions.{InteractiveSessionManager, SessionState, Spark}
 import com.cloudera.livy.test.jobs.Echo
+import com.cloudera.livy.utils.AppInfo
 
 /**
  * The test for the HTTP client is written in Scala so we can reuse the code in the livy-server
  * module, which implements the client session backend. The client servlet has some functionality
  * overridden to avoid creating sub-processes for each seession.
  */
-class HttpClientSpec extends FunSpecLike with BeforeAndAfterAll {
+class HttpClientSpec extends FunSpecLike with BeforeAndAfterAll with LivyBaseUnitTestSuite {
 
   import HttpClientSpec._
 
@@ -88,7 +89,7 @@ class HttpClientSpec extends FunSpecLike with BeforeAndAfterAll {
   describe("HTTP client library") {
 
     it("should create clients") {
-      // WebServer does this internally instad of respecting "0.0.0.0", so try to use the same
+      // WebServer does this internally instead of respecting "0.0.0.0", so try to use the same
       // address.
       val uri = s"http://${InetAddress.getLocalHost.getHostAddress}:${server.port}/"
       client = new LivyClientBuilder(false).setURI(new URI(uri)).build()
@@ -264,11 +265,16 @@ private class HttpClientTestBootstrap extends LifeCycle {
   private implicit def executor: ExecutionContext = ExecutionContext.global
 
   override def init(context: ServletContext): Unit = {
-    val servlet = new InteractiveSessionServlet(new LivyConf()) {
+    val conf = new LivyConf()
+    val stateStore = mock(classOf[SessionStore])
+    val sessionManager = new InteractiveSessionManager(conf, stateStore, Some(Seq.empty))
+    val servlet = new InteractiveSessionServlet(sessionManager, stateStore, conf) {
       override protected def createSession(req: HttpServletRequest): InteractiveSession = {
         val session = mock(classOf[InteractiveSession])
         val id = sessionManager.nextId()
         when(session.id).thenReturn(id)
+        when(session.appId).thenReturn(None)
+        when(session.appInfo).thenReturn(AppInfo())
         when(session.state).thenReturn(SessionState.Idle())
         when(session.proxyUser).thenReturn(None)
         when(session.kind).thenReturn(Spark())

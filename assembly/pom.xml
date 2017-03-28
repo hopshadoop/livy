@@ -21,27 +21,19 @@
   <parent>
     <groupId>com.cloudera.livy</groupId>
     <artifactId>livy-main</artifactId>
-    <version>0.3.0-SNAPSHOT</version>
+    <version>0.4.0-SNAPSHOT</version>
     <relativePath>../pom.xml</relativePath>
   </parent>
 
   <artifactId>livy-assembly</artifactId>
-  <version>0.3.0-SNAPSHOT</version>
+  <version>0.4.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
   <properties>
     <assembly.name>livy-server-${project.version}</assembly.name>
     <assembly.format>zip</assembly.format>
+    <skipDeploy>true</skipDeploy>
   </properties>
-
-  <profiles>
-    <profile>
-      <id>targz</id>
-      <properties>
-        <assembly.format>tar.gz</assembly.format>
-      </properties>
-    </profile>
-  </profiles>
 
   <dependencies>
     <dependency>
@@ -49,11 +41,19 @@
       <artifactId>livy-rsc</artifactId>
       <version>${project.version}</version>
     </dependency>
+
     <dependency>
       <groupId>${project.groupId}</groupId>
-      <artifactId>livy-repl</artifactId>
+      <artifactId>livy-repl_2.10</artifactId>
       <version>${project.version}</version>
     </dependency>
+
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>livy-repl_2.11</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
     <dependency>
       <groupId>${project.groupId}</groupId>
       <artifactId>livy-server</artifactId>
@@ -87,5 +87,14 @@
       </plugin>
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>targz</id>
+      <properties>
+        <assembly.format>tar.gz</assembly.format>
+      </properties>
+    </profile>
+  </profiles>
 
 </project>

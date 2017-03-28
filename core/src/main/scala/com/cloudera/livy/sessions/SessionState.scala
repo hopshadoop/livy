@@ -23,7 +23,28 @@ sealed trait SessionState {
   def isActive: Boolean
 }
 
+sealed trait FinishedSessionState extends SessionState {
+  /** When session is finished. */
+  def time: Long
+}
+
 object SessionState {
+
+  def apply(s: String): SessionState = {
+    s match {
+      case "not_started" => NotStarted()
+      case "starting" => Starting()
+      case "recovering" => Recovering()
+      case "idle" => Idle()
+      case "running" => Running()
+      case "busy" => Busy()
+      case "shutting_down" => ShuttingDown()
+      case "error" => Error()
+      case "dead" => Dead()
+      case "success" => Success()
+      case _ => throw new IllegalArgumentException(s"Illegal session state: $s")
+    }
+  }
 
   case class NotStarted() extends SessionState {
     override def isActive: Boolean = true
@@ -35,6 +56,12 @@ object SessionState {
     override def isActive: Boolean = true
 
     override def toString: String = "starting"
+  }
+
+  case class Recovering() extends SessionState {
+    override def isActive: Boolean = true
+
+    override def toString: String = "recovering"
   }
 
   case class Idle() extends SessionState {
@@ -61,19 +88,19 @@ object SessionState {
     override def toString: String = "shutting_down"
   }
 
-  case class Error(time: Long = System.nanoTime()) extends SessionState {
+  case class Error(time: Long = System.nanoTime()) extends FinishedSessionState {
     override def isActive: Boolean = true
 
     override def toString: String = "error"
   }
 
-  case class Dead(time: Long = System.nanoTime()) extends SessionState {
+  case class Dead(time: Long = System.nanoTime()) extends FinishedSessionState {
     override def isActive: Boolean = false
 
     override def toString: String = "dead"
   }
 
-  case class Success(time: Long = System.nanoTime()) extends SessionState {
+  case class Success(time: Long = System.nanoTime()) extends FinishedSessionState {
     override def isActive: Boolean = false
 
     override def toString: String = "success"

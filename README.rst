@@ -1,6 +1,9 @@
 Welcome to Livy
 ===============
 
+.. image:: https://travis-ci.org/cloudera/livy.svg?branch=master
+    :target: https://travis-ci.org/cloudera/livy
+
 Livy is an open source REST interface for interacting with `Apache Spark`_ from anywhere.
 It supports executing snippets of code or programs in a Spark context that runs locally or in `Apache Hadoop YARN`_.
 
@@ -42,10 +45,24 @@ MacOS:
   * Python 2.6+
   * R 3.x
 
+Required python packages for building Livy:
+  * cloudpickle
+  * requests
+  * requests-kerberos
+  * flake8
+  * flaky
+  * pytest
+
 
 To run Livy, you will also need a Spark installation. You can get Spark releases at
-https://spark.apache.org/downloads.html. Livy requires at least Spark 1.4 and currently
-only supports Scala 2.10 builds of Spark.
+https://spark.apache.org/downloads.html.
+
+Livy requires at least Spark 1.6 and supports both Scala 2.10 and 2.11 builds of Spark, Livy
+will automatically pick repl dependencies through detecting the Scala version of Spark.
+
+Livy also supports Spark 2.0+ for both interactive and batch submission, you could seamlessly
+switch to different versions of Spark through ``SPARK_HOME`` configuration, without needing to
+rebuild Livy.
 
 
 Building Livy
@@ -59,16 +76,11 @@ Livy is built using `Apache Maven`_. To check out and build Livy, run:
     cd livy
     mvn package
 
-By default Livy is built against the CDH 5.5 distribution of Spark (based off Spark 1.5.0). You can
-build Livy against a different version of Spark by setting the ``spark.version`` property:
-
-.. code:: shell
-
-    mvn -Dspark.version=1.6.1 package
-
-The version of Spark used when running Livy does not need to match the version used to build Livy.
-The Livy package itself does not contain a Spark distribution, and will work with any supported
-version of Spark.
+By default Livy is built against Apache Spark 1.6.2, but the version of Spark used when running
+Livy does not need to match the version used to build Livy. Livy internally uses reflection to
+mitigate the gaps between different Spark versions, also Livy package itself does not
+contain a Spark distribution, so it will work with any supported version of Spark (Spark 1.6+)
+without needing to rebuild against specific version of Spark.
 
 .. _Apache Maven: http://maven.apache.org
 
@@ -117,7 +129,6 @@ The configuration files used by Livy are:
 * ``log4j.properties``: configuration for Livy logging. Defines log levels and where log messages
   will be written to. The default configuration will print log messages to stderr.
 
-
 Upgrade from Livy 0.1
 =====================
 
@@ -142,6 +153,114 @@ A few things changed between since Livy 0.1 that require manual intervention whe
     with Livy for instructions.
 
   * ``livy.server.spark-submit``: replaced by the ``SPARK_HOME`` environment variable.
+
+
+Using the Programmatic API
+==========================
+
+Livy provides a programmatic Java/Scala and Python API that allows applications to run code inside
+Spark without having to maintain a local Spark context. Here shows how to use the Java API.
+
+Add the Cloudera repository to your application's POM:
+
+.. code:: xml
+
+    <repositories>
+      <repository>
+        <id>cloudera.repo</id>
+        <url>https://repository.cloudera.com/artifactory/cloudera-repos</url>
+        <name>Cloudera Repositories</name>
+        <snapshots>
+          <enabled>false</enabled>
+        </snapshots>
+      </repository>
+    </repositories>
+
+
+And add the Livy client dependency:
+
+.. code:: xml
+
+    <dependency>
+      <groupId>com.cloudera.livy</groupId>
+      <artifactId>livy-client-http</artifactId>
+      <version>0.2.0</version>
+    </dependency>
+
+
+To be able to compile code that uses Spark APIs, also add the correspondent Spark dependencies.
+
+To run Spark jobs within your applications, extend ``com.cloudera.livy.Job`` and implement
+the functionality you need. Here's an example job that calculates an approximate value for Pi:
+
+.. code:: java
+
+    import java.util.*;
+
+    import org.apache.spark.api.java.*;
+    import org.apache.spark.api.java.function.*;
+
+    import com.cloudera.livy.*;
+
+    public class PiJob implements Job<Double>, Function<Integer, Integer>,
+      Function2<Integer, Integer, Integer> {
+
+      private final int samples;
+
+      public PiJob(int samples) {
+        this.samples = samples;
+      }
+
+      @Override
+      public Double call(JobContext ctx) throws Exception {
+        List<Integer> sampleList = new ArrayList<Integer>();
+        for (int i = 0; i < samples; i++) {
+          sampleList.add(i + 1);
+        }
+
+        return 4.0d * ctx.sc().parallelize(sampleList).map(this).reduce(this) / samples;
+      }
+
+      @Override
+      public Integer call(Integer v1) {
+        double x = Math.random();
+        double y = Math.random();
+        return (x*x + y*y < 1) ? 1 : 0;
+      }
+
+      @Override
+      public Integer call(Integer v1, Integer v2) {
+        return v1 + v2;
+      }
+
+    }
+
+
+To submit this code using Livy, create a LivyClient instance and upload your application code to
+the Spark context. Here's an example of code that submits the above job and prints the computed
+value:
+
+.. code:: java
+
+    LivyClient client = new LivyClientBuilder()
+      .setURI(new URI(livyUrl))
+      .build();
+
+    try {
+      System.err.printf("Uploading %s to the Spark context...\n", piJar);
+      client.uploadJar(new File(piJar)).get();
+
+      System.err.printf("Running PiJob with %d samples...\n", samples);
+      double pi = client.submit(new PiJob(samples)).get();
+
+      System.out.println("Pi is roughly: " + pi);
+    } finally {
+      client.stop(true);
+    }
+
+
+To learn about all the functionality available to applications, read the javadoc documentation for
+the classes under the ``api`` module.
 
 
 Spark Example
@@ -208,7 +327,7 @@ Pi. This is from the `Spark Examples`_:
 .. code:: python
 
     data = {
-      'code': textwrap.dedent("""\
+      'code': textwrap.dedent("""
         val NUM_SAMPLES = 100000;
         val count = sc.parallelize(1 to NUM_SAMPLES).map { i =>
           val x = Math.random();
@@ -220,6 +339,10 @@ Pi. This is from the `Spark Examples`_:
     }
 
     r = requests.post(statements_url, data=json.dumps(data), headers=headers)
+    pprint.pprint(r.json())
+
+    statement_url = host + r.headers['location']
+    r = requests.get(statement_url, headers=headers)
     pprint.pprint(r.json())
 
     {u'id': 1,
@@ -299,7 +422,7 @@ The Pi example from before then can be run as:
 .. code:: python
 
     data = {
-      'code': textwrap.dedent("""\
+      'code': textwrap.dedent("""
         n <- 100000
         piFunc <- function(elem) {
           rands <- runif(n = 2, min = -1, max = 1)
@@ -334,6 +457,9 @@ Community
 
  * User group: http://groups.google.com/a/cloudera.org/group/livy-user
  * Dev group: http://groups.google.com/a/cloudera.org/group/livy-dev
+ * Dev slack: https://livy-dev.slack.com.
+
+   To join: http://livy-slack-invite.azurewebsites.net. Invite token: ``I'm not a bot``.
  * JIRA: https://issues.cloudera.org/browse/LIVY
  * Pull requests: https://github.com/cloudera/livy/pulls
 
@@ -346,33 +472,72 @@ GET /sessions
 
 Returns all the active interactive sessions.
 
+Request Parameters
+^^^^^^^^^^^^^^^^^^
+
++------+-----------------------------------+------+
+| name | description                       | type |
++======+===================================+======+
+| from | The start index to fetch sessions | int  |
++------+-----------------------------------+------+
+| size | Number of sessions to fetch       | int  |
++------+-----------------------------------+------+
+
 Response Body
 ^^^^^^^^^^^^^
 
-+----------+-----------------+------+
-| name     | description     | type |
-+==========+=================+======+
-| sessions | `Session`_ list | list |
-+----------+-----------------+------+
++----------+-------------------------------------+------+
+| name     | description                         | type |
++==========+=====================================+======+
+| from     | The start index of fetched sessions | int  |
++----------+-------------------------------------+------+
+| total    | Number of sessions fetched          | int  |
++----------+-------------------------------------+------+
+| sessions | `Session`_ list                     | list |
++----------+-------------------------------------+------+
 
 
 POST /sessions
 --------------
 
-Creates a new interative Scala, Python, or R shell in the cluster.
+Creates a new interactive Scala, Python, or R shell in the cluster.
 
 Request Body
 ^^^^^^^^^^^^
 
-+----------------+------------------------------------------------+-----------------+
-| name           | description                                    | type            |
-+================+================================================+=================+
-| kind           | The session kind (required)                    | `session kind`_ |
-+----------------+------------------------------------------------+-----------------+
-| proxyUser      | User to impersonate when starting the session  | string          |
-+----------------+------------------------------------------------+-----------------+
-| conf           | Spark configuration properties                 | Map of key=val  |
-+----------------+------------------------------------------------+-----------------+
++--------------------------+------------------------------------------------+-----------------+
+| name                     | description                                    | type            |
++==========================+================================================+=================+
+| kind                     | The session kind (required)                    | `session kind`_ |
++--------------------------+------------------------------------------------+-----------------+
+| proxyUser                | User to impersonate when starting the session  | string          |
++--------------------------+------------------------------------------------+-----------------+
+| jars                     | jars to be used in this session                | List of string  |
++--------------------------+------------------------------------------------+-----------------+
+| pyFiles                  | Python files to be used in this session        | List of string  |
++--------------------------+------------------------------------------------+-----------------+
+| files                    | files to be used in this session               | List of string  |
++--------------------------+------------------------------------------------+-----------------+
+| driverMemory             | Amount of memory to use for the driver process | string          |
++--------------------------+------------------------------------------------+-----------------+
+| driverCores              | Number of cores to use for the driver process  | int             |
++--------------------------+------------------------------------------------+-----------------+
+| executorMemory           | Amount of memory to use per executor process   | string          |
++--------------------------+------------------------------------------------+-----------------+
+| executorCores            | Number of cores to use for each executor       | int             |
++--------------------------+------------------------------------------------+-----------------+
+| numExecutors             | Number of executors to launch for this session | int             |
++--------------------------+------------------------------------------------+-----------------+
+| archives                 | Archives to be used in this session            | List of string  |
++--------------------------+------------------------------------------------+-----------------+
+| queue                    | The name of the YARN queue to which submitted  | string          |
++--------------------------+------------------------------------------------+-----------------+
+| name                     | The name of this session                       | string          |
++--------------------------+------------------------------------------------+-----------------+
+| conf                     | Spark configuration properties                 | Map of key=val  |
++--------------------------+------------------------------------------------+-----------------+
+| heartbeatTimeoutInSecond | Timeout in second to which session be orphaned | int             |
++--------------------------+------------------------------------------------+-----------------+
 
 
 Response Body
@@ -386,10 +551,27 @@ GET /sessions/{sessionId}
 
 Returns the session information.
 
+Response Body
+^^^^^^^^^^^^^
+
+The `Session`_.
+
+
+GET /sessions/{sessionId}/state
+-------------------------------
+
+Returns the state of session
+
 Response
 ^^^^^^^^
 
-The `Session`_.
++-------+-----------------------------------+--------+
+| name  | description                       | type   |
++=======+===================================+========+
+| id    | Session id                        | int    |
++-------+-----------------------------------+--------+
+| state | The current state of session      | string |
++-------+-----------------------------------+--------+
 
 
 DELETE /sessions/{sessionId}
@@ -398,7 +580,7 @@ DELETE /sessions/{sessionId}
 Kills the `Session`_ job.
 
 
-GET /sessions/{sessionId}/logs
+GET /sessions/{sessionId}/log
 ------------------------------
 
 Gets the log lines from this session.
@@ -465,19 +647,60 @@ Response Body
 The `statement`_ object.
 
 
-GET /batches
-------------
+GET /sessions/{sessionId}/statements/{statementId}
+--------------------------------------------------
 
-Returns all the active batch jobs.
+Returns a specified statement in a session.
 
 Response Body
 ^^^^^^^^^^^^^
 
-+---------+---------------+------+
-| name    | description   | type |
-+=========+===============+======+
-|sessions | `batch`_ list | list |
-+---------+---------------+------+
+The `statement`_ object.
+
+
+POST /sessions/{sessionId}/statements/{statementId}/cancel
+----------------------------------------------------------
+
+Cancel the specified statement in this session.
+
+Response Body
+^^^^^^^^^^^^^
+
++------+----------------------------+--------+
+| name | description                | type   |
++======+============================+========+
+| msg  | is always "cancelled"      | string |
++------+----------------------------+--------+
+
+
+GET /batches
+-------------
+
+Returns all the active batch sessions.
+
+Request Parameters
+^^^^^^^^^^^^^^^^^^
+
++------+-----------------------------------+------+
+| name | description                       | type |
++======+===================================+======+
+| from | The start index to fetch sessions | int  |
++------+-----------------------------------+------+
+| size | Number of sessions to fetch       | int  |
++------+-----------------------------------+------+
+
+Response Body
+^^^^^^^^^^^^^
+
++----------+-------------------------------------+------+
+| name     | description                         | type |
++==========+=====================================+======+
+| from     | The start index of fetched sessions | int  |
++----------+-------------------------------------+------+
+| total    | Number of sessions fetched          | int  |
++----------+-------------------------------------+------+
+| sessions | `Batch`_ list                       | list |
++----------+-------------------------------------+------+
 
 
 POST /batches
@@ -486,20 +709,41 @@ POST /batches
 Request Body
 ^^^^^^^^^^^^
 
-+-------------+---------------------------------------------------+-----------------+
-| name        | description                                       | type            |
-+=============+===================================================+=================+
-| file        | File containing the application to execute        | path (required) |
-+-------------+---------------------------------------------------+-----------------+
-| proxyUser   | User to impersonate when running the job          | string          |
-+-------------+---------------------------------------------------+-----------------+
-| className   | Application Java/Spark main class                 | string          |
-+-------------+---------------------------------------------------+-----------------+
-| args        | Command line arguments for the application        | list of strings |
-+-------------+---------------------------------------------------+-----------------+
-| conf        | Spark configuration properties                    | Map of key=val  |
-+-------------+---------------------------------------------------+-----------------+
-
++----------------+---------------------------------------------------+-----------------+
+| name           | description                                       | type            |
++================+===================================================+=================+
+| file           | File containing the application to execute        | path (required) |
++----------------+---------------------------------------------------+-----------------+
+| proxyUser      | User to impersonate when running the job          | string          |
++----------------+---------------------------------------------------+-----------------+
+| className      | Application Java/Spark main class                 | string          |
++----------------+---------------------------------------------------+-----------------+
+| args           | Command line arguments for the application        | list of strings |
++----------------+---------------------------------------------------+-----------------+
+| jars           | jars to be used in this session                   | List of string  |
++----------------+---------------------------------------------------+-----------------+
+| pyFiles        | Python files to be used in this session           | List of string  |
++----------------+---------------------------------------------------+-----------------+
+| files          | files to be used in this session                  | List of string  |
++----------------+---------------------------------------------------+-----------------+
+| driverMemory   | Amount of memory to use for the driver process    | string          |
++----------------+---------------------------------------------------+-----------------+
+| driverCores    | Number of cores to use for the driver process     | int             |
++----------------+---------------------------------------------------+-----------------+
+| executorMemory | Amount of memory to use per executor process      | string          |
++----------------+---------------------------------------------------+-----------------+
+| executorCores  | Number of cores to use for each executor          | int             |
++----------------+---------------------------------------------------+-----------------+
+| numExecutors   | Number of executors to launch for this session    | int             |
++----------------+---------------------------------------------------+-----------------+
+| archives       | Archives to be used in this session               | List of string  |
++----------------+---------------------------------------------------+-----------------+
+| queue          | The name of the YARN queue to which submitted     | string          |
++----------------+---------------------------------------------------+-----------------+
+| name           | The name of this session                          | string          |
++----------------+---------------------------------------------------+-----------------+
+| conf           | Spark configuration properties                    | Map of key=val  |
++----------------+---------------------------------------------------+-----------------+
 
 Response Body
 ^^^^^^^^^^^^^
@@ -510,29 +754,29 @@ The created `Batch`_ object.
 GET /batches/{batchId}
 ----------------------
 
-Request Parameters
-^^^^^^^^^^^^^^^^^^
-
-+------+---------------------------------+------+
-| name | description                     | type |
-+======+=================================+======+
-| from | Offset                          | int  |
-+------+---------------------------------+------+
-| size | Max number of batches to return | int  |
-+------+---------------------------------+------+
+Returns the batch session information.
 
 Response Body
 ^^^^^^^^^^^^^
 
-+-------+-----------------------------+-----------------+
-| name  | description                 | type            |
-+=======+=============================+=================+
-| id    | The batch id                | int             |
-+-------+-----------------------------+-----------------+
-| state | The state of the batch      | `batch`_ state  |
-+-------+-----------------------------+-----------------+
-| log   | The output of the batch job | list of strings |
-+-------+-----------------------------+-----------------+
+The `Batch`_.
+
+
+GET /batches/{batchId}/state
+----------------------------
+
+Returns the state of batch session
+
+Response
+^^^^^^^^
+
++-------+-----------------------------------+--------+
+| name  | description                       | type   |
++=======+===================================+========+
+| id    | Batch session id                  | int    |
++-------+-----------------------------------+--------+
+| state | The current state of batch session| string |
++-------+-----------------------------------+--------+
 
 
 DELETE /batches/{batchId}
@@ -542,7 +786,7 @@ Kills the `Batch`_ job.
 
 
 GET /batches/{batchId}/log
----------------------------
+--------------------------
 
 Gets the log lines from this batch.
 
@@ -586,45 +830,79 @@ A session represents an interactive shell.
 +================+==========================================+============================+
 | id             | The session id                           | int                        |
 +----------------+------------------------------------------+----------------------------+
-| kind           | Session kind (spark, pyspark, or sparkr) | `session kind`_ (required) |
+| appId          | The application id of this session       | String                     |
++----------------+------------------------------------------+----------------------------+
+| owner          | Remote user who submitted this session   | String                     |
++----------------+------------------------------------------+----------------------------+
+| proxyUser      | User to impersonate when running         | String                     |
++----------------+------------------------------------------+----------------------------+
+| kind           | Session kind (spark, pyspark, or sparkr) | `session kind`_            |
 +----------------+------------------------------------------+----------------------------+
 | log            | The log lines                            | list of strings            |
 +----------------+------------------------------------------+----------------------------+
 | state          | The session state                        | string                     |
++----------------+------------------------------------------+----------------------------+
+| appInfo        | The detailed application info            | Map of key=val             |
 +----------------+------------------------------------------+----------------------------+
 
 
 Session State
 ^^^^^^^^^^^^^
 
-+-------------+----------------------------------+
-| value       | description                      |
-+=============+==================================+
-| not_started | Session has not been started     |
-+-------------+----------------------------------+
-| starting    | Session is starting              |
-+-------------+----------------------------------+
-| idle        | Session is waiting for input     |
-+-------------+----------------------------------+
-| busy        | Session is executing a statement |
-+-------------+----------------------------------+
-| error       | Session errored out              |
-+-------------+----------------------------------+
-| dead        | Session has exited               |
-+-------------+----------------------------------+
++---------------+----------------------------------+
+| value         | description                      |
++===============+==================================+
+| not_started   | Session has not been started     |
++---------------+----------------------------------+
+| starting      | Session is starting              |
++---------------+----------------------------------+
+| idle          | Session is waiting for input     |
++---------------+----------------------------------+
+| busy          | Session is executing a statement |
++---------------+----------------------------------+
+| shutting_down | Session is shutting down         |
++---------------+----------------------------------+
+| error         | Session errored out              |
++---------------+----------------------------------+
+| dead          | Session has exited               |
++---------------+----------------------------------+
+| success       | Session is successfully stopped  |
++---------------+----------------------------------+
 
 Session Kind
 ^^^^^^^^^^^^
 
-+---------+----------------------------------+
-| value   | description                      |
-+=========+==================================+
-| spark   | Interactive Scala Spark session  |
-+---------+----------------------------------+
-| pyspark | Interactive Python Spark session |
-+---------+----------------------------------+
-| sparkr  | Interactive R Spark session      |
-+---------+----------------------------------+
++-------------+------------------------------------+
+| value       | description                        |
++=============+====================================+
+| spark       | Interactive Scala  Spark session   |
++-------------+------------------------------------+
+| `pyspark`_  | Interactive Python 2 Spark session |
++-------------+------------------------------------+
+| `pyspark3`_ | Interactive Python 3 Spark session |
++-------------+------------------------------------+
+| sparkr      | Interactive R Spark session        |
++-------------+------------------------------------+
+
+pyspark
+^^^^^^^
+To change the Python executable the session uses, Livy reads the path from environment variable
+``PYSPARK_PYTHON`` (Same as pyspark).
+
+Like pyspark, if Livy is running in ``local`` mode, just set the environment variable.
+If the session is running in ``yarn-cluster`` mode, please set
+``spark.yarn.appMasterEnv.PYSPARK_PYTHON`` in SparkConf so the environment variable is passed to
+the driver.
+
+pyspark3
+^^^^^^^^
+To change the Python executable the session uses, Livy reads the path from environment variable
+``PYSPARK3_PYTHON``.
+
+Like pyspark, if Livy is running in ``local`` mode, just set the environment variable.
+If the session is running in ``yarn-cluster`` mode, please set
+``spark.yarn.appMasterEnv.PYSPARK3_PYTHON`` in SparkConf so the environment variable is passed to
+the driver.
 
 Statement
 ---------
@@ -644,15 +922,21 @@ A statement represents the result of an execution statement.
 Statement State
 ^^^^^^^^^^^^^^^
 
-+-----------+----------------------------------+
-| value     | description                      |
-+===========+==================================+
-| running   | Statement is currently running   |
-+-----------+----------------------------------+
-| available | Statement has a response ready   |
-+-----------+----------------------------------+
-| error     | Statement failed                 |
-+-----------+----------------------------------+
++------------+----------------------------------------------------+
+| value      | description                                        |
++============+====================================================+
+| waiting    | Statement is enqueued but execution hasn't started |
++------------+----------------------------------------------------+
+| running    | Statement is currently running                     |
++------------+----------------------------------------------------+
+| available  | Statement has a response ready                     |
++------------+----------------------------------------------------+
+| error      | Statement failed                                   |
++------------+----------------------------------------------------+
+| cancelling | Statement is being cancelling                      |
++------------+----------------------------------------------------+
+| cancelled  | Statement is cancelled                             |
++------------+----------------------------------------------------+
 
 Statement Output
 ^^^^^^^^^^^^^^^^
@@ -662,7 +946,7 @@ Statement Output
 +=================+===================+==================================+
 | status          | Execution status  | string                           |
 +-----------------+-------------------+----------------------------------+
-| execution_count | A monotomically   | integer                          |
+| execution_count | A monotonically   | integer                          |
 |                 | increasing number |                                  |
 +-----------------+-------------------+----------------------------------+
 | data            | Statement output  | An object mapping a mime type to |
@@ -674,15 +958,19 @@ Statement Output
 Batch
 -----
 
-+----------------+------------------+----------------------------+
-| name           | description      | type                       |
-+================+==================+============================+
-| id             | The session id   | int                        |
-+----------------+------------------+----------------------------+
-| log            | The log lines    | list of strings            |
-+----------------+------------------+----------------------------+
-| state          | The batch state  | string                     |
-+----------------+------------------+----------------------------+
++----------------+-------------------------------------+-----------------+
+| name           | description                         | type            |
++================+=====================================+=================+
+| id             | The session id                      | int             |
++----------------+-------------------------------------+-----------------+
+| appId          | The application id of this session  | String          |
++----------------+-------------------------------------+-----------------+
+| appInfo        | The detailed application info       | Map of key=val  |
++----------------+-------------------------------------+-----------------+
+| log            | The log lines                       | list of strings |
++----------------+-------------------------------------+-----------------+
+| state          | The batch state                     | string          |
++----------------+-------------------------------------+-----------------+
 
 
 License

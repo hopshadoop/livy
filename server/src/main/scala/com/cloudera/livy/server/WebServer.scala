@@ -18,23 +18,15 @@
 
 package com.cloudera.livy.server
 
-import java.net.{InetAddress, InetSocketAddress}
+import java.net.InetAddress
 import javax.servlet.ServletContextListener
-
-import scala.concurrent.ExecutionContext
 
 import org.eclipse.jetty.server._
 import org.eclipse.jetty.server.handler.{HandlerCollection, RequestLogHandler}
 import org.eclipse.jetty.servlet.{DefaultServlet, ServletContextHandler}
 import org.eclipse.jetty.util.ssl.SslContextFactory
-import org.scalatra.servlet.AsyncSupport
 
 import com.cloudera.livy.{LivyConf, Logging}
-
-object WebServer {
-  val KeystoreKey = "livy.keystore"
-  val KeystorePasswordKey = "livy.keystore.password"
-}
 
 class WebServer(livyConf: LivyConf, var host: String, var port: Int) extends Logging {
   val server = new Server()
@@ -42,7 +34,7 @@ class WebServer(livyConf: LivyConf, var host: String, var port: Int) extends Log
   server.setStopTimeout(1000)
   server.setStopAtShutdown(true)
 
-  val (connector, protocol) = Option(livyConf.get(WebServer.KeystoreKey)) match {
+  val (connector, protocol) = Option(livyConf.get(LivyConf.SSL_KEYSTORE)) match {
     case None =>
       (new ServerConnector(server), "http")
 
@@ -52,9 +44,9 @@ class WebServer(livyConf: LivyConf, var host: String, var port: Int) extends Log
 
       val sslContextFactory = new SslContextFactory()
       sslContextFactory.setKeyStorePath(keystore)
-      Option(livyConf.get(WebServer.KeystorePasswordKey))
+      Option(livyConf.get(LivyConf.SSL_KEYSTORE_PASSWORD))
         .foreach(sslContextFactory.setKeyStorePassword)
-      Option(livyConf.get(WebServer.KeystorePasswordKey))
+      Option(livyConf.get(LivyConf.SSL_KEY_PASSWORD))
         .foreach(sslContextFactory.setKeyManagerPassword)
 
       (new ServerConnector(server,
@@ -71,17 +63,19 @@ class WebServer(livyConf: LivyConf, var host: String, var port: Int) extends Log
 
   context.setContextPath("/")
   context.addServlet(classOf[DefaultServlet], "/")
-  context.setAttribute(AsyncSupport.ExecutionContextKey, ExecutionContext.global)
 
   val handlers = new HandlerCollection
   handlers.addHandler(context)
 
-//  configure the access log
+  // Configure the access log
   val requestLogHandler = new RequestLogHandler
-  val requestLog = new NCSARequestLog("/jetty-yyyy_mm_dd.request.log")
+  val requestLog = new NCSARequestLog(sys.env.getOrElse("LIVY_LOG_DIR",
+    sys.env("LIVY_HOME") + "/logs") + "/yyyy_mm_dd.request.log")
   requestLog.setAppend(true)
   requestLog.setExtended(false)
   requestLog.setLogTimeZone("GMT")
+  requestLog.setRetainDays(livyConf.getInt(LivyConf.REQUEST_LOG_RETAIN_DAYS))
+  requestLogHandler.setRequestLog(requestLog)
   handlers.addHandler(requestLogHandler)
 
   server.setHandler(handlers)
