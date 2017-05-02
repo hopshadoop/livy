@@ -2,7 +2,7 @@
 set -e
 
 if [ $# -ne 1 ] ; then
-  echo "Usage: <pro> SPARK_VERSION  (e.g., 1.6.1)"
+  echo "Usage: <pro> SPARK_VERSION  (e.g., 2.1.0)"
   exit 1
 fi
 
