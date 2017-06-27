@@ -19,6 +19,10 @@
 # What spark deploy mode Livy sessions should use.
 # livy.spark.deploy-mode =
 
+# Configure Livy server http request and response header size.
+# livy.server.request-header.size = 131072
+# livy.server.response-header.size = 131072
+
 # Enabled to check whether timeout Livy sessions should be stopped.
 # livy.server.session.timeout-check = true
 
@@ -97,3 +101,6 @@
 #
 # Days to keep Livy server request logs.
 # livy.server.request-log-retain.days = 5
+
+# If the Livy Web UI should be included in the Livy Server. Enabled by default.
+# livy.ui.enabled = true
