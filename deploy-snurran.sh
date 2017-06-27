@@ -18,5 +18,5 @@ echo "Livy version is: $VERSION . Spark version is: $SPARK_VERSION"
 mvn clean -DskipTests -Dspark.version=$SPARK_VERSION package
 
 
-scp assembly/target/livy-server-0.3.0-SNAPSHOT.zip glassfish@snurran.sics.se:/var/www/hops/
+scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/
 
