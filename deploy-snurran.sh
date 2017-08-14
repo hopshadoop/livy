@@ -15,7 +15,8 @@ git merge upstream/master
 SPARK_VERSION=$1
 echo "Livy version is: $VERSION . Spark version is: $SPARK_VERSION"
 
-mvn clean -DskipTests -Dspark.version=$SPARK_VERSION package
+mvn clean -DskipTests -Pspark=$SPARK_VERSION package
+#mvn clean -DskipTests -Dspark.version=$SPARK_VERSION package
 
 
 scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/
