@@ -1028,7 +1028,7 @@
     </profile>
 
     <profile>
-      <id>spark-2.2</id>
+      <id>spark-2.1</id>
       <activation>
         <property>
           <name>spark-2.1</name>
