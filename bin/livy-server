@@ -81,7 +81,19 @@ start_livy_server() {
     exit 1
   fi
 
-  LIVY_CLASSPATH="$LIBDIR/*:$LIVY_CONF_DIR"
+  export HADOOP_CLASSPATH=$(${HADOOP_CONF_DIR}/../../bin/hadoop classpath)
+  echo "Appending to classpath the Hadoop classpath: $HADOOP_CLASSPATH"
+  if [ $? -ne 0 ]; then
+      echo "Could not find Hadoop classpath using '$HADOOP_HOME/bin/hadoop classpath'. HADOOP_HOME was: $HADOOP_HOME"
+      exit 2
+  fi
+  SPARK_JARS_DIR=${SPARK_HOME}/jars
+  if [ ! -d $SPARK_JARS_DIR ]; then
+    echo "Could not find Spark jars directory in ${SPARK_CONF_DIR}/../jars." 1>&2
+    exit 3
+  fi
+     
+  LIVY_CLASSPATH="$LIBDIR/*:$LIVY_CONF_DIR:$HADOOP_CLASSPATH:$SPARK_JARS_DIR/*"
 
   if [ -n "$SPARK_CONF_DIR" ]; then
     LIVY_CLASSPATH="$LIVY_CLASSPATH:$SPARK_CONF_DIR"

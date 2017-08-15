@@ -43,8 +43,8 @@
 
   <properties>
     <hadoop.version>2.7.3</hadoop.version>
-    <hadoop.scope>compile</hadoop.scope>
-    <spark.version>1.6.2</spark.version>
+    <hadoop.scope>provided</hadoop.scope>
+    <spark.version>2.2.0</spark.version>
     <commons-codec.version>1.9</commons-codec.version>
     <httpclient.version>4.5.2</httpclient.version>
     <httpcore.version>4.4.4</httpcore.version>
@@ -61,11 +61,11 @@
     <py4j.version>0.9</py4j.version>
     <scala-2.10.version>2.10.4</scala-2.10.version>
     <scala-2.11.version>2.11.8</scala-2.11.version>
-    <scala.binary.version>2.10</scala.binary.version>
-    <scala.version>${scala-2.10.version}</scala.version>
+    <scala.binary.version>2.11</scala.binary.version>
+    <scala.version>${scala-2.11.version}</scala.version>
     <scalatest.version>2.2.4</scalatest.version>
     <scalatra.version>2.3.0</scalatra.version>
-    <java.version>1.7</java.version>
+    <java.version>1.8</java.version>
     <minJavaVersion>1.7</minJavaVersion>
     <maxJavaVersion>1.8</maxJavaVersion>
     <test.redirectToFile>true</test.redirectToFile>
@@ -173,6 +173,15 @@
         <enabled>false</enabled>
       </snapshots>
     </repository>
+    
+    <repository>
+      <id>sics-release-repository</id>
+      <name>SICS Release Repository</name>
+      <url>http://kompics.sics.se/maven/repository</url>
+      <releases>
+      </releases>
+    </repository>
+    
   </repositories>
 
   <modules>
@@ -306,6 +315,7 @@
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-auth</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -318,6 +328,7 @@
             <artifactId>servlet-api</artifactId>
           </exclusion>
         </exclusions>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -325,12 +336,14 @@
         <artifactId>hadoop-common</artifactId>
         <classifier>tests</classifier>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-client</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -344,24 +357,28 @@
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-api</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-client</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-common</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-server-tests</artifactId>
         <classifier>tests</classifier>
+        <scope>${hadoop.scope}</scope>
         <version>${hadoop.version}</version>
       </dependency>
 
@@ -387,12 +404,14 @@
             <artifactId>javax.servlet</artifactId>
           </exclusion>
         </exclusions>
+        <scope>provided</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.spark</groupId>
         <artifactId>spark-hive_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
+        <scope>provided</scope>
       </dependency>
 
       <dependency>
@@ -405,18 +424,21 @@
             <artifactId>unused</artifactId>
           </exclusion>
         </exclusions>
+        <scope>provided</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.spark</groupId>
         <artifactId>spark-repl_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
+        <scope>provided</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.spark</groupId>
         <artifactId>spark-sql_${scala.binary.version}</artifactId>
         <version>${spark.version}</version>
+        <scope>provided</scope>
       </dependency>
 
       <dependency>
@@ -845,17 +867,17 @@
             <configuration>
               <target>
                 <copy file="${execution.root}/scalastyle.xml"
-                  tofile="${project.build.directory}/scalastyle.xml" />
+                      tofile="${project.build.directory}/scalastyle.xml" />
                 <replace file="${project.build.directory}/scalastyle.xml"
-                  token="{{COPYRIGHT_HEADER}}"
-                  value="${copyright.header}" />
+                         token="{{COPYRIGHT_HEADER}}"
+                         value="${copyright.header}" />
                 <copy file="${execution.root}/checkstyle.xml"
-                  tofile="${project.build.directory}/checkstyle.xml" />
+                      tofile="${project.build.directory}/checkstyle.xml" />
                 <echo file="${project.build.directory}/checkstyle.header"
-                  message="${copyright.header}" />
+                      message="${copyright.header}" />
                 <replace file="${project.build.directory}/checkstyle.xml"
-                  token="{{HEADER_FILE}}"
-                  value="${project.build.directory}/checkstyle.header" />
+                         token="{{HEADER_FILE}}"
+                         value="${project.build.directory}/checkstyle.header" />
               </target>
             </configuration>
           </execution>
@@ -997,14 +1019,14 @@
     </profile>
 
     <profile>
-      <id>spark-2.0</id>
+      <id>spark-2.2</id>
       <activation>
         <property>
-          <name>spark-2.0</name>
+          <name>spark-2.2</name>
         </property>
       </activation>
       <properties>
-        <spark.version>2.0.1</spark.version>
+        <spark.version>2.2.0</spark.version>
       </properties>
     </profile>
 
