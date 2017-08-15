@@ -351,7 +351,6 @@
         <artifactId>hadoop-hdfs</artifactId>
         <classifier>tests</classifier>
         <version>${hadoop.version}</version>
-        <scope>test</scope>
       </dependency>
 
       <dependency>
@@ -379,7 +378,7 @@
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-server-tests</artifactId>
         <classifier>tests</classifier>
-        <scope>test</scope>
+        <scope>${hadoop.scope}</scope>
         <version>${hadoop.version}</version>
       </dependency>
 
