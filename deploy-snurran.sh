@@ -1,8 +1,8 @@
 #!/bin/bash
 set -e
 
-if [ $# -ne 1 ] ; then
-  echo "Usage: <pro> SPARK_VERSION  (e.g., 2.1.0)"
+if [ $# -lt 1 ] ; then
+  echo "Usage: $0 SPARK_VERSION [test]  (e.g., 2.1.0)"
   exit 1
 fi
 
@@ -16,8 +16,15 @@ SPARK_VERSION=$1
 echo "Livy version is: $VERSION . Spark version is: $SPARK_VERSION"
 
 mvn clean -DskipTests -Pspark=$SPARK_VERSION package
-#mvn clean -DskipTests -Dspark.version=$SPARK_VERSION package
 
-
-scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/
+if [ $# -gt 1 ] ; then
+  if [ "$2" == "test" ] ; then
+    scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/test
+  else
+    echo "Error. The only valid 2nd parameter is 'test'"
+    exit 2
+  fi
+else 
+  scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/
+fi
 

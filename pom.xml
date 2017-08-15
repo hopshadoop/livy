@@ -61,11 +61,11 @@
     <py4j.version>0.9</py4j.version>
     <scala-2.10.version>2.10.4</scala-2.10.version>
     <scala-2.11.version>2.11.8</scala-2.11.version>
-    <scala.binary.version>2.10</scala.binary.version>
-    <scala.version>${scala-2.10.version}</scala.version>
+    <scala.binary.version>2.11</scala.binary.version>
+    <scala.version>${scala-2.11.version}</scala.version>
     <scalatest.version>2.2.4</scalatest.version>
     <scalatra.version>2.3.0</scalatra.version>
-    <java.version>1.7</java.version>
+    <java.version>1.8</java.version>
     <minJavaVersion>1.7</minJavaVersion>
     <maxJavaVersion>1.8</maxJavaVersion>
     <test.redirectToFile>true</test.redirectToFile>
@@ -315,6 +315,7 @@
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-auth</artifactId>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -327,7 +328,7 @@
             <artifactId>servlet-api</artifactId>
           </exclusion>
         </exclusions>
-        <scope>provided</scope>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -335,13 +336,14 @@
         <artifactId>hadoop-common</artifactId>
         <classifier>tests</classifier>
         <version>${hadoop.version}</version>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-client</artifactId>
         <version>${hadoop.version}</version>
-        <scope>provided</scope>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
@@ -349,33 +351,35 @@
         <artifactId>hadoop-hdfs</artifactId>
         <classifier>tests</classifier>
         <version>${hadoop.version}</version>
+        <scope>test</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-api</artifactId>
         <version>${hadoop.version}</version>
-        <scope>provided</scope>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-client</artifactId>
         <version>${hadoop.version}</version>
-        <scope>provided</scope>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-common</artifactId>
         <version>${hadoop.version}</version>
-        <scope>provided</scope>
+        <scope>${hadoop.scope}</scope>
       </dependency>
 
       <dependency>
         <groupId>org.apache.hadoop</groupId>
         <artifactId>hadoop-yarn-server-tests</artifactId>
         <classifier>tests</classifier>
+        <scope>test</scope>
         <version>${hadoop.version}</version>
       </dependency>
 
@@ -864,17 +868,17 @@
             <configuration>
               <target>
                 <copy file="${execution.root}/scalastyle.xml"
-                  tofile="${project.build.directory}/scalastyle.xml" />
+                      tofile="${project.build.directory}/scalastyle.xml" />
                 <replace file="${project.build.directory}/scalastyle.xml"
-                  token="{{COPYRIGHT_HEADER}}"
-                  value="${copyright.header}" />
+                         token="{{COPYRIGHT_HEADER}}"
+                         value="${copyright.header}" />
                 <copy file="${execution.root}/checkstyle.xml"
-                  tofile="${project.build.directory}/checkstyle.xml" />
+                      tofile="${project.build.directory}/checkstyle.xml" />
                 <echo file="${project.build.directory}/checkstyle.header"
-                  message="${copyright.header}" />
+                      message="${copyright.header}" />
                 <replace file="${project.build.directory}/checkstyle.xml"
-                  token="{{HEADER_FILE}}"
-                  value="${project.build.directory}/checkstyle.header" />
+                         token="{{HEADER_FILE}}"
+                         value="${project.build.directory}/checkstyle.header" />
               </target>
             </configuration>
           </execution>
