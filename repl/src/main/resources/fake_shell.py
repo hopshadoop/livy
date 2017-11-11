@@ -1,21 +1,23 @@
-# Licensed to Cloudera, Inc. under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  Cloudera, Inc. licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 
 from __future__ import print_function
 import ast
+from collections import OrderedDict
 import datetime
 import decimal
 import io
@@ -99,6 +101,8 @@ class JobContextImpl(object):
         self.streaming_ctx = None
         self.local_tmp_dir_path = local_tmp_dir_path
         self.spark_session = global_dict.get('spark')
+        self.shared_variables = OrderedDict()
+        self.max_var_size = 100
 
     def sc(self):
         return self.sc
@@ -148,6 +152,31 @@ class JobContextImpl(object):
     def spark_session(self):
         return self.spark_session
 
+    def get_shared_object(self, name):
+        with self.lock:
+            try:
+                var = self.shared_variables[name]
+                del self.shared_variables[name]
+                self.shared_variables[name] = var
+            except:
+                var = None
+
+        return var
+
+    def set_shared_object(self, name, object):
+        with self.lock:
+            self.shared_variables[name] = object
+
+            while len(self.shared_variables) > self.max_var_size:
+                self.popitem(last=False)
+
+    def remove_shared_object(self, name):
+        with self.lock:
+            try:
+                del self.shared_variables[name]
+            except:
+                pass
+
 
 class PySparkJobProcessorImpl(object):
     def processBypassJob(self, serialized_job):
@@ -173,7 +202,7 @@ class PySparkJobProcessorImpl(object):
         return os.path.join(job_context.get_local_tmp_dir_path(), '__livy__')
 
     class Scala:
-        extends = ['com.cloudera.livy.repl.PySparkJobProcessor']
+        extends = ['org.apache.livy.repl.PySparkJobProcessor']
 
 
 class ExecutionError(Exception):
@@ -530,14 +559,42 @@ def main():
         listening_port = 0
         if os.environ.get("LIVY_TEST") != "true":
             #Load spark into the context
-            exec('from pyspark.shell import sc', global_dict)
-            exec('from pyspark.shell import sqlContext', global_dict)
             exec('from pyspark.sql import HiveContext', global_dict)
             exec('from pyspark.streaming import StreamingContext', global_dict)
             exec('import pyspark.cloudpickle as cloudpickle', global_dict)
 
+            from py4j.java_gateway import java_import, JavaGateway, GatewayClient
+            from pyspark.conf import SparkConf
+            from pyspark.context import SparkContext
+            from pyspark.sql import SQLContext, HiveContext, Row
+            # Connect to the gateway
+            gateway_port = int(os.environ["PYSPARK_GATEWAY_PORT"])
+            gateway = JavaGateway(GatewayClient(port=gateway_port), auto_convert=True)
+
+            # Import the classes used by PySpark
+            java_import(gateway.jvm, "org.apache.spark.SparkConf")
+            java_import(gateway.jvm, "org.apache.spark.api.java.*")
+            java_import(gateway.jvm, "org.apache.spark.api.python.*")
+            java_import(gateway.jvm, "org.apache.spark.mllib.api.python.*")
+            java_import(gateway.jvm, "org.apache.spark.sql.*")
+            java_import(gateway.jvm, "org.apache.spark.sql.hive.*")
+            java_import(gateway.jvm, "scala.Tuple2")
+
+            jsc = gateway.entry_point.sc()
+            jconf = gateway.entry_point.sc().getConf()
+            jsqlc = gateway.entry_point.hivectx() if gateway.entry_point.hivectx() is not None \
+                else gateway.entry_point.sqlctx()
+
+            conf = SparkConf(_jvm = gateway.jvm, _jconf = jconf)
+            sc = SparkContext(jsc=jsc, gateway=gateway, conf=conf)
+            global_dict['sc'] = sc
+            sqlc = SQLContext(sc, jsqlc)
+            global_dict['sqlContext'] = sqlc
+
             if spark_major_version >= "2":
-                exec('from pyspark.shell import spark', global_dict)
+                from pyspark.sql import SparkSession
+                spark_session = SparkSession(sc, gateway.entry_point.sparkSession())
+                global_dict['spark'] = spark_session
             else:
                 # LIVY-294, need to check whether HiveContext can work properly,
                 # fallback to SQLContext if HiveContext can not be initialized successfully.

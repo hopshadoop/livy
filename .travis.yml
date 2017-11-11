@@ -1,17 +1,44 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
 sudo: required
 dist: trusty
 language: scala
 
 env:
-  - MVN_FLAG='-Pspark-1.6 -DskipTests'
-  - MVN_FLAG='-Pspark-2.0 -DskipTests'
-  - MVN_FLAG='-Pspark-2.1 -DskipTests'
-  - MVN_FLAG='-Pspark-1.6 -DskipITs'
-  - MVN_FLAG='-Pspark-2.0 -DskipITs'
-  - MVN_FLAG='-Pspark-2.1 -DskipITs'
+  matrix:
+    - MVN_FLAG='-Pspark-1.6 -DskipTests'
+    - MVN_FLAG='-Pspark-2.0 -DskipTests'
+    - MVN_FLAG='-Pspark-2.1 -DskipTests'
+    - MVN_FLAG='-Pspark-1.6 -DskipITs'
+    - MVN_FLAG='-Pspark-2.0 -DskipITs'
+    - MVN_FLAG='-Pspark-2.1 -DskipITs'
+
+matrix:
+  include:
+      # Spark 2.2 will only be verified using JDK8
+    - env: MVN_FLAG='-Pspark-2.2 -DskipTests'
+      jdk: oraclejdk8
+    - env: MVN_FLAG='-Pspark-2.2 -DskipITs'
+      jdk: oraclejdk8
+
 
 jdk:
-  - oraclejdk7
+  - openjdk7
 
 addons:
   apt:
@@ -30,17 +57,17 @@ before_install:
   - sudo apt-get -y install python3-pip python-dev
   - sudo apt-get -y install libkrb5-dev
   - sudo apt-get -y remove python-setuptools
-  - pip install --user --upgrade pip "setuptools < 36"
+  - pip2 install --user --upgrade pip "setuptools < 36"
   - pip3 install --user --upgrade pip "setuptools < 36"
-  - pip install --user codecov cloudpickle
+  - pip2 install --user codecov cloudpickle
   - pip3 install --user cloudpickle
 
 install:
   - mvn $MVN_FLAG install -Dskip -DskipTests -DskipITs -Dmaven.javadoc.skip=true -B -V
 
 before_script:
-  - pip install --user requests pytest flaky flake8 requests-kerberos
-  - pip3 install --user requests pytest flaky requests-kerberos
+  - pip2 install --user "requests >= 2.10.0" pytest flaky flake8 requests-kerberos
+  - pip3 install --user "requests >= 2.10.0" pytest flaky requests-kerberos
 
 script:
   - mvn $MVN_FLAG verify -e
