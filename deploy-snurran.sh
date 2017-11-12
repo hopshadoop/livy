@@ -26,6 +26,6 @@ if [ $# -gt 1 ] ; then
     exit 2
   fi
 else 
-  scp assembly/target/livy-server-${VERSION}.zip glassfish@snurran.sics.se:/var/www/hops/
+  scp assembly/target/livy-${VERSION}-bin.zip glassfish@snurran.sics.se:/var/www/hops/
 fi
 
