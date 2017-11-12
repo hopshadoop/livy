@@ -78,7 +78,7 @@
   </mailingLists>
 
   <properties>
-    <hadoop.version>2.8.2.2</hadoop.version>
+    <hadoop.version>2.8.2</hadoop.version>
     <hadoop.scope>provided</hadoop.scope>
     <spark.version>2.2.0</spark.version>
     <commons-codec.version>1.9</commons-codec.version>
