@@ -15,8 +15,7 @@ VERSION=`grep -o -a -m 1 -h -r "version>.*</version" pom.xml | head -1 | sed "s/
 SPARK_VERSION=$1
 echo "Livy version is: $VERSION . Spark version is: $SPARK_VERSION"
 
-#mvn clean -DskipTests -Pspark-$SPARK_VERSION package
-mvn -DskipTests -Pspark-$SPARK_VERSION package
+mvn clean -DskipTests -Pspark-$SPARK_VERSION package
 
 if [ $# -gt 1 ] ; then
   if [ "$2" == "test" ] ; then
