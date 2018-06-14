@@ -1,13 +1,12 @@
 #
-# Licensed to Cloudera, Inc. under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  Cloudera, Inc. licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -71,6 +70,7 @@ class HttpClient(object):
         uri = urlparse(url)
         self._config = ConfigParser()
         self._load_config(load_defaults, conf_dict)
+        self._job_type = 'pyspark'
         match = re.match(r'(.*)/sessions/([0-9]+)', uri.path)
         if match:
             base = ParseResult(scheme=uri.scheme, netloc=uri.netloc,
@@ -335,7 +335,7 @@ class HttpClient(object):
                         headers = {'X-Requested-By': 'livy'}
                         self._conn.send_request("DELETE", session_uri,
                             headers=headers)
-                except:
+                except Exception:
                     raise Exception(traceback.format_exc())
                 self._stopped = True
 
@@ -396,7 +396,8 @@ class HttpClient(object):
     def _send_job(self, command, job):
         pickled_job = cloudpickle.dumps(job)
         base64_pickled_job = base64.b64encode(pickled_job).decode('utf-8')
-        base64_pickled_job_data = {'job': base64_pickled_job}
+        base64_pickled_job_data = \
+            {'job': base64_pickled_job, 'jobType': self._job_type}
         handle = JobHandle(self._conn, self._session_id,
             self._executor)
         handle._start(command, base64_pickled_job_data)

@@ -1,13 +1,12 @@
 #
-# Licensed to Cloudera, Inc. under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  Cloudera, Inc. licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
 #
-#     http://www.apache.org/licenses/LICENSE-2.0
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
@@ -47,7 +46,7 @@ def process_job(job, expected_result, is_error_job=False):
 
     pickled_job = cloudpickle.dumps(job)
     base64_pickled_job = base64.b64encode(pickled_job).decode('utf-8')
-    base64_pickled_job_json = json.dumps({'job': base64_pickled_job})
+    base64_pickled_job_json = json.dumps({'job': base64_pickled_job, 'jobType': 'pyspark'})
     request_url = livy_end_point + "/sessions/" + str(session_id) + "/submit-job"
     header = {'Content-Type': 'application/json', 'X-Requested-By': 'livy'}
     response = requests.request('POST', request_url, headers=header, data=base64_pickled_job_json)
@@ -55,8 +54,8 @@ def process_job(job, expected_result, is_error_job=False):
     assert response.status_code == httplib.CREATED
     job_id = response.json()['id']
 
-    poll_time = 0.1
-    max_poll_time = 10
+    poll_time = 1
+    max_poll_time = 30
     poll_response = None
     while (poll_response is None or poll_response.json()['state'] == 'STARTED') and poll_time < \
             max_poll_time:
@@ -82,7 +81,7 @@ def process_job(job, expected_result, is_error_job=False):
 
 
 def delay_rerun(*args):
-    time.sleep(8)
+    time.sleep(10)
     return True
 
 
